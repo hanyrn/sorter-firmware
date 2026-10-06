@@ -1,0 +1,6 @@
+# Python
+__pycache__/
+*.pyc
+
+# Arduino / arduino-cli build output
+build/
