@@ -17,6 +17,40 @@
 #define SORTER_COMBINE_MEAN   1
 
 // ===========================================================================
+// Bench test: DAC -> AD7606 loopback
+// ===========================================================================
+// SORTER_SIGNAL_GEN = 1 makes the M4 drive the GIGA's two 12-bit DAC outputs so
+// a *known* synthetic waveform can be fed straight into the AD7606 inputs,
+// turning the whole chain (parallel bus -> combine -> detector -> RPC -> M7
+// printout) into a hardware-in-the-loop check of the peak detector.
+//
+//   DAC_0 / DAC = A12 = PA_4 = DAC1_OUT1  ->  AD7606 module 0 input
+//   DAC_1       = A13 = PA_5 = DAC1_OUT2  ->  AD7606 module 1 input
+//
+// Set this to 0 for the real application: the DACs are then left untouched and
+// all 16 channels feed the combined sample (see SORTER_ACTIVE_CHANNEL_MASK).
+#define SORTER_SIGNAL_GEN     1
+
+// Fixed acquisition rate. 0 = free-run at the fastest rate the loop sustains.
+// 10 kSPS is the rate the detector bounds are written for (and the rate used by
+// test/model_check.py); it also guarantees the AD7606 analog input settles
+// between samples, so the injected waveform is not smeared by the module's
+// anti-aliasing filter.
+#define SORTER_SAMPLE_RATE_HZ 10000u
+
+// Which channels are combined into the single sample per conversion:
+//   bit i = channel i  (0..7 = module 0, 8..15 = module 1)
+// In the real application every channel carries a signal, so combine all 16.
+// In the bench loopback only the DAC-driven inputs are live, so combining just
+// those keeps the amplitude intact and keeps the floating inputs from adding
+// noise to the combined sample.
+#if SORTER_SIGNAL_GEN
+  #define SORTER_ACTIVE_CHANNEL_MASK  ((1u << 0) | (1u << 8))
+#else
+  #define SORTER_ACTIVE_CHANNEL_MASK  0x0000FFFFu
+#endif
+
+// ===========================================================================
 // AD7606 parallel bus -- Arduino GIGA R1 WiFi digital pins
 // ===========================================================================
 //
@@ -106,6 +140,29 @@ static const uint8_t AD7606_BUSY1_PIN  = D42;
 #define DET_MAX_WIDTH_SAMPLES  200000u
 #define DET_MIN_AREA           0ull
 #define DET_MAX_SLOPE          100.0f
+
+// ===========================================================================
+// Synthetic signal generator (bench test only, SORTER_SIGNAL_GEN = 1)
+// ===========================================================================
+// The pattern itself (pulse timings/shapes) lives in signal_gen.cpp (kPattern);
+// these values scale it into DAC codes.
+#define SIGNALGEN_CYCLE_SAMPLES  20000u  // pattern length (2.0 s at 10 kSPS)
+#define SIGNALGEN_BASELINE_CODE  2048    // DC level in DAC codes (~1.65 V)
+#define SIGNALGEN_NOISE_CODE     6       // dither amplitude in DAC codes (~4.8 mV)
+#define SIGNALGEN_NOISE_ALPHA    1.0f    // dither low-pass weight (1.0 = white)
+#define SIGNALGEN_SEED           0x2F6E2B1u
+
+// The DAC output buffer is only linear from roughly 0.2 V to VDDA-0.2 V, so keep
+// the generated code inside this window (250 .. 3850 of 0 .. 4095).
+#define SIGNALGEN_MIN_CODE       250
+#define SIGNALGEN_MAX_CODE       3850
+
+// AD7606 counts per DAC count. Calibrate this against your module's RANGE
+// jumper; the printed max= values scale with it:
+//   DAC            : 4096 codes over ~3.3 V (VREF+)         = 1241 codes/V
+//   AD7606 +/-10 V : 32768 counts / 10 V = 3276.8 counts/V  -> 2.64 counts/count
+//   AD7606 +/-5 V  : 32768 counts /  5 V = 6553.6 counts/V  -> 5.28 counts/count
+#define SIGNALGEN_ADC_PER_DAC    2.64f
 
 // Busy-wait helper used for sub-microsecond AD7606 timing margins.
 static inline void tinyDelayNs(uint32_t ns) {

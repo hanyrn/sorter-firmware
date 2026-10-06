@@ -1,0 +1,15 @@
+{
+    "files.associations": {
+        "*.ino": "cpp"
+    },
+    "C_Cpp.files.exclude": {
+        "**/.vscode": true,
+        "**/build": true
+    },
+    "files.exclude": {
+        "**/build/sketch": true
+    },
+    "search.exclude": {
+        "**/build": true
+    }
+}
