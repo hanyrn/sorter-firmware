@@ -34,13 +34,16 @@
 // (0..7 = module 0, 8..15 = module 1). Every listed channel keeps its own
 // baseline/noise tracker and its own per-event metrics (see SORTER_METRIC_MODE);
 // a channel outside the mask is neither evaluated nor reported, so an unused
-// (floating) input can never inject a phantom event.
-// In the real application the 9 wired channels are 0..8, i.e. 0x01FF.
+// (floating) input can never inject a phantom event - and tracking fewer channels
+// leaves more headroom per sample in the acquisition loop.
+// In the real application only the 9 wired channels are used: 0..8, i.e. 0x01FF.
+// The other 7 inputs (9..15) are not connected to any sensor, so they are not
+// tracked at all.
 // In the bench loopback only the DAC-driven inputs (0 and 8) are live.
 #if SORTER_SIGNAL_GEN
   #define SORTER_ACTIVE_CHANNEL_MASK  ((1u << 0) | (1u << 8))
 #else
-  #define SORTER_ACTIVE_CHANNEL_MASK  0x0000FFFFu
+  #define SORTER_ACTIVE_CHANNEL_MASK  0x000001FFu   // channels 0..8 (9 wired inputs)
 #endif
 
 // ===========================================================================

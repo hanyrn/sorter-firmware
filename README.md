@@ -439,8 +439,8 @@ Notes:
   timeout — but you are then only testing the toolchain and the serial link, since
   the floating data lines make the detector report noise.
 * The checked-in default is the **bench build** (`SORTER_SIGNAL_GEN 1`, DACs drive
-  channels 0/8). Set it to `0` for the real application, where all 16 channels are
-  measured on their own.
+  channels 0/8). Set it to `0` for the real application, where the 9 wired channels
+  (0..8) are measured on their own.
 
 ## Testing
 
@@ -579,8 +579,10 @@ baseline**, so peaks are positive excursions — exactly what the detector's
 ### Turning the bench test off
 
 Set `SORTER_SIGNAL_GEN 0` in `config.h`: the DACs are then never touched, the loop
-free-runs again, and all 16 channels are measured on their own
-(`SORTER_ACTIVE_CHANNEL_MASK` = `0xFFFF`) — the production configuration.
+free-runs again, and the 9 wired channels are measured on their own
+(`SORTER_ACTIVE_CHANNEL_MASK` = `0x01FF`, channels 0..8) — the production
+configuration. The other 7 inputs are not connected to any sensor, so they are left
+out of the mask and are neither tracked nor reported.
 
 ## Notes / next steps
 
