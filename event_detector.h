@@ -4,8 +4,10 @@
 //
 // Signal model
 // ------------
-//   * The combined signal sits at a low, slowly varying baseline with Gaussian
-//     noise fluctuations on top of it.
+//   * It runs on ONE channel: the signal sits at a low, slowly varying baseline
+//     with Gaussian noise fluctuations on top of it.  EventAggregator owns one
+//     detector per AD7606 channel and assembles the per-channel results into a
+//     single event bundle.
 //   * An event starts when the signal rises above  baseline + k_on * sigma.
 //   * The event reaches a maximum and then decays back into the noise band; it
 //     is closed when the signal falls back below  baseline + k_off * sigma
@@ -58,8 +60,8 @@ public:
     EventDetector() { reset(); }
     explicit EventDetector(const Config& c) : cfg_(c) { reset(); }
 
-    // Feed one combined sample.
-    //   x     : combined sample value (e.g. mean of all channels)
+    // Feed one sample of the channel this detector is tracking.
+    //   x     : channel sample value (AD7606 counts)
     //   t_us  : timestamp in microseconds
     //   index : monotonically increasing sample index (used for width in samples)
     //   out   : filled when this call closes an event
@@ -131,6 +133,21 @@ public:
     float baseline() const { return mean_; }
     float sigma()    const { return sigma_; }
 
+    // The rejection ladder used to judge a closed peak. Exposed as a static so
+    // EventAggregator can judge metrics it measured itself (a channel's height /
+    // area inside another channel's window) with exactly the same rules.
+    // Returns REASON_OK when the peak satisfies every bound.
+    static uint8_t classifyPeak(const Config& cfg, int32_t max_value,
+                                uint32_t width_samples, uint64_t area) {
+        if (max_value < cfg.min_max_value)         { return REASON_MAX_TOO_SMALL; }
+        if (width_samples < cfg.min_width_samples) { return REASON_WIDTH_TOO_NARROW; }
+        if (width_samples > cfg.max_width_samples) { return REASON_WIDTH_TOO_WIDE; }
+        if (area < cfg.min_area)                   { return REASON_AREA_TOO_SMALL; }
+        const float slope = (float)max_value / (float)(width_samples ? width_samples : 1u);
+        if (slope > cfg.max_slope)                 { return REASON_SHORT_FOR_HEIGHT; }
+        return REASON_OK;
+    }
+
 private:
     enum State { STATE_WARMUP, STATE_IDLE, STATE_EVENT };
 
@@ -178,22 +195,11 @@ private:
         out.max_value     = ev_max_;
         out.max_abs_value = base_at_start_ + ev_max_;
         out.area          = ev_area_;
-        out.valid         = 1;
-        out.reason        = REASON_OK;
 
-        // Most specific rejection first.
-        if (ev_max_ < cfg_.min_max_value) {
-            out.valid  = 0; out.reason = REASON_MAX_TOO_SMALL;
-        } else if (width_samples < cfg_.min_width_samples) {
-            out.valid  = 0; out.reason = REASON_WIDTH_TOO_NARROW;
-        } else if (width_samples > cfg_.max_width_samples) {
-            out.valid  = 0; out.reason = REASON_WIDTH_TOO_WIDE;
-        } else if (ev_area_ < cfg_.min_area) {
-            out.valid  = 0; out.reason = REASON_AREA_TOO_SMALL;
-        } else {
-            const float slope = (float)ev_max_ / (float)(width_samples ? width_samples : 1u);
-            if (slope > cfg_.max_slope) { out.valid = 0; out.reason = REASON_SHORT_FOR_HEIGHT; }
-        }
+        // Verdict from the shared bound ladder (the same one EventAggregator uses
+        // for metrics it measured over another channel's window).
+        out.reason        = classifyPeak(cfg_, ev_max_, width_samples, ev_area_);
+        out.valid         = metricsValid(out.reason) ? 1u : 0u;
 
         // Resume idle tracking. The baseline was intentionally NOT updated during
         // the event, so a long/strong peak cannot drag it upwards.

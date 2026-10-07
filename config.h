@@ -8,27 +8,19 @@
 #include <Arduino.h>
 
 // ===========================================================================
-// Feature flags
-// ===========================================================================
-
-// How the 16 channels are combined into a single sample:
-//   1 = mean   (sum / 16), keeps the value in the AD7606 native +/-32768 range
-//   0 = sum    (raw accumulation, more resolution, larger values)
-#define SORTER_COMBINE_MEAN   1
-
-// ===========================================================================
 // Bench test: DAC -> AD7606 loopback
 // ===========================================================================
 // SORTER_SIGNAL_GEN = 1 makes the M4 drive the GIGA's two 12-bit DAC outputs so
 // a *known* synthetic waveform can be fed straight into the AD7606 inputs,
-// turning the whole chain (parallel bus -> combine -> detector -> RPC -> M7
-// printout) into a hardware-in-the-loop check of the peak detector.
+// turning the whole chain (parallel bus -> per-channel detectors -> event
+// aggregation -> RPC -> M7 printout) into a hardware-in-the-loop check of the
+// peak detector.
 //
 //   DAC_0 / DAC = A12 = PA_4 = DAC1_OUT1  ->  AD7606 module 0 input
 //   DAC_1       = A13 = PA_5 = DAC1_OUT2  ->  AD7606 module 1 input
 //
 // Set this to 0 for the real application: the DACs are then left untouched and
-// all 16 channels feed the combined sample (see SORTER_ACTIVE_CHANNEL_MASK).
+// every active channel is measured on its own (see SORTER_ACTIVE_CHANNEL_MASK).
 #define SORTER_SIGNAL_GEN     1
 
 // Fixed acquisition rate. 0 = free-run at the fastest rate the loop sustains.
@@ -38,17 +30,45 @@
 // anti-aliasing filter.
 #define SORTER_SAMPLE_RATE_HZ 10000u
 
-// Which channels are combined into the single sample per conversion:
-//   bit i = channel i  (0..7 = module 0, 8..15 = module 1)
-// In the real application every channel carries a signal, so combine all 16.
-// In the bench loopback only the DAC-driven inputs are live, so combining just
-// those keeps the amplitude intact and keeps the floating inputs from adding
-// noise to the combined sample.
+// Which channels carry a signal worth measuring:  bit i = channel i
+// (0..7 = module 0, 8..15 = module 1). Every listed channel keeps its own
+// baseline/noise tracker and its own per-event metrics (see SORTER_METRIC_MODE);
+// a channel outside the mask is neither evaluated nor reported, so an unused
+// (floating) input can never inject a phantom event.
+// In the real application the 9 wired channels are 0..8, i.e. 0x01FF.
+// In the bench loopback only the DAC-driven inputs (0 and 8) are live.
 #if SORTER_SIGNAL_GEN
   #define SORTER_ACTIVE_CHANNEL_MASK  ((1u << 0) | (1u << 8))
 #else
   #define SORTER_ACTIVE_CHANNEL_MASK  0x0000FFFFu
 #endif
+
+// ===========================================================================
+// How one event is assembled from the per-channel metrics
+// ===========================================================================
+// The detector runs once per channel (each channel gets its own baseline, noise
+// floor and threshold), so height / width / area are measured per channel.  How
+// the per-channel results are tied together into one event is selectable:
+//
+//   SORTER_METRIC_MODE = 1 (linked, the default)
+//       SORTER_PRIMARY_CHANNEL times the event: the shared window opens when
+//       that channel rises above its on-threshold and closes when it falls back
+//       below.  Every other channel's height/area is measured INSIDE that window
+//       only, and all channels of the event report the primary's width (one
+//       uniform event width).  Use a channel that is present for every event
+//       (the 9th here) as the primary.
+//
+//   SORTER_METRIC_MODE = 0 (per-channel)
+//       Every channel is treated separately: its own start, its own end and its
+//       own width, so the widths legitimately differ from channel to channel.
+//       The event is reported once ALL channels that entered it have closed
+//       again (the detector's own max_width_samples guard closes a channel that
+//       never returns, so an event can never hang).
+//
+// In both modes the M4 sends one bundle per event: the window plus one record
+// per active channel.  A channel that never rose is reported as absent.
+#define SORTER_METRIC_MODE     1
+#define SORTER_PRIMARY_CHANNEL 8
 
 // ===========================================================================
 // AD7606 parallel buses -- Arduino GIGA R1 WiFi digital pins

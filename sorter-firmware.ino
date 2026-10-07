@@ -8,19 +8,21 @@
 //   Cortex-M4 (240 MHz) -- full acquisition + signal-processing pipeline:
 //     * reads two AD7606 modules, each on its own 16-bit parallel bus, with
 //       shared control lines (one instant for all 16 channels),
-//     * combines the enabled channels into one sample per conversion
-//       (SORTER_ACTIVE_CHANNEL_MASK; all 16 in the real application),
-//     * detects peak events on an adaptive baseline + std-dev threshold,
-//     * computes max value / area / width and rejects false peaks,
-//     * forwards each closed event to the M7 over the RPC raw endpoint.
+//     * runs one peak detector per channel (own baseline + std-dev threshold), so
+//       every channel gets its own height / width / area,
+//     * groups the per-channel results of one event into a bundle
+//       (event_aggregator.h: linked to a primary channel, or per-channel - see
+//       SORTER_METRIC_MODE) and rejects false peaks,
+//     * forwards each completed event to the M7 over the RPC raw endpoint.
 //
 //   Bench mode (SORTER_SIGNAL_GEN = 1; see signal_gen.{h,cpp} and the README):
 //     the same M4 loop additionally drives the two DAC outputs (A12/A13) with a
 //     known synthetic waveform, so the detector can be validated on real
 //     hardware through a DAC -> AD7606 loopback instead of a real signal.
 //
-//   Cortex-M7 (480 MHz) -- placeholder consumer of the peak metrics. For now it
-//     only prints them; the higher-level application logic is added later.
+//   Cortex-M7 (480 MHz) -- placeholder consumer of the event metrics. For now it
+//     only prints them (one line per channel); the higher-level application logic
+//     is added later.
 
 #include <RPC.h>
 using namespace rtos;
@@ -28,6 +30,7 @@ using namespace rtos;
 #include "config.h"
 #include "peak_metrics.h"
 #include "event_detector.h"
+#include "event_aggregator.h"
 #include "adc7606_parallel.h"
 #include "metrics_sink.h"
 #include "signal_gen.h"
@@ -35,7 +38,8 @@ using namespace rtos;
 // ===========================================================================
 // M4: acquisition + detection pipeline
 // ===========================================================================
-static EventDetector   g_detector;
+static EventAggregator g_aggregator;
+static EventRecord     g_event;      // staging record for the event being measured
 static Adc7606Parallel g_adc;
 static Thread          g_acqThread(osPriorityHigh, 4096, nullptr, "adc");
 #if SORTER_SIGNAL_GEN
@@ -86,19 +90,28 @@ static EventDetector::Config makeDetectorConfig() {
     return c;
 }
 
-// Runs forever on the M4: generate, convert, read, combine, detect, report.
+// How the per-channel detectors are grouped into one event bundle.
+static EventAggregator::Config makeAggregatorConfig() {
+    EventAggregator::Config c;
+    c.detector     = makeDetectorConfig();
+    c.channel_mask = SORTER_ACTIVE_CHANNEL_MASK;
+    c.mode         = SORTER_METRIC_MODE ? METRIC_MODE_LINKED : METRIC_MODE_PER_CHANNEL;
+    c.primary      = (uint8_t)SORTER_PRIMARY_CHANNEL;
+    return c;
+}
+
+// Runs forever on the M4: generate, convert, read, detect per channel, report.
 static void acquisitionTask() {
-    g_detector.configure(makeDetectorConfig());
+    g_aggregator.configure(makeAggregatorConfig());
     g_adc.begin();
     g_adc.reset();
 #if SORTER_SIGNAL_GEN
     g_signalGen.begin();     // bench test: bring the DACs up on the baseline
 #endif
 
-    int32_t     channels[AD7606_NUM_CHANNELS];
-    PeakMetrics metrics;
-    uint32_t    index          = 0;
-    uint32_t    next_sample_us = micros();
+    int32_t  channels[AD7606_NUM_CHANNELS];
+    uint32_t index          = 0;
+    uint32_t next_sample_us = micros();
 
     for (;;) {
         waitNextSample(next_sample_us);
@@ -113,41 +126,28 @@ static void acquisitionTask() {
 
         g_adc.readAll(channels);
 
-        int64_t  sum = 0;
-        uint32_t n   = 0;
-        for (uint8_t i = 0; i < AD7606_NUM_CHANNELS; i++) {
-            if ((SORTER_ACTIVE_CHANNEL_MASK & (1uL << i)) != 0u) {
-                sum += channels[i];
-                n++;
-            }
-        }
-        if (n == 0u) { n = 1u; }   // guard against an empty channel mask
-#if SORTER_COMBINE_MEAN
-        const int32_t combined = (int32_t)(sum / (int64_t)n);
-#else
-        const int32_t combined = (int32_t)sum;
-#endif
-
-        if (g_detector.update(combined, micros(), index, metrics)) {
-            sorter::sendPeak(metrics);   // hand the closed event to the M7
+        // Every channel is measured on its own; a completed event carries one
+        // record per active channel and is handed to the M7 in a single frame.
+        if (g_aggregator.update(channels, micros(), index, g_event)) {
+            sorter::sendBundle(g_event.bundle, g_event.ch);
         }
         index++;
     }
 }
 
 // ===========================================================================
-// M7: receive peak metrics from the M4
+// M7: receive event bundles from the M4
 // ===========================================================================
-static Mail<PeakMetrics, 16> g_m7Mail;
+static Mail<EventRecord, 4> g_m7Mail;   // events are rare: 4 pending is plenty
 
 static void onMetricsRaw(const uint8_t* buf, size_t len) {
-    PeakMetrics m;
-    if (!sorter::parsePeak(buf, len, m)) {
+    EventRecord rec;
+    if (!sorter::parseBundle(buf, len, rec)) {
         return;
     }
-    PeakMetrics* slot = g_m7Mail.try_alloc();
+    EventRecord* slot = g_m7Mail.try_alloc();
     if (slot != nullptr) {
-        *slot = m;
+        *slot = rec;
         g_m7Mail.put(slot);
     }
 }
@@ -165,17 +165,43 @@ static const char* reasonName(uint8_t reason) {
     }
 }
 
-static void printMetrics(const PeakMetrics& m) {
-    Serial.print("Peak #");    Serial.print(m.index);
-    Serial.print(m.valid ? "  VALID     " : "  rejected  ");
-    Serial.print("reason=");    Serial.print(m.reason);
-    Serial.print(' ');          Serial.print(reasonName(m.reason));
-    Serial.print("  max=");     Serial.print(m.max_value);
-    Serial.print("  area=");    Serial.print((uint32_t)m.area);
-    Serial.print("  width=");   Serial.print(m.width_us);
-    Serial.print("us/");        Serial.print(m.width_samples);
-    Serial.print("smp  base="); Serial.print(m.baseline);
-    Serial.print("  sigma=");   Serial.println(m.noise);
+// One line for the event (window + verdict), then one line per active channel.
+static void printBundle(const EventRecord& rec) {
+    const EventBundle& b = rec.bundle;
+
+    Serial.print("Event #");    Serial.print(b.index);
+    Serial.print(b.valid ? "  VALID     " : "  rejected  ");
+    Serial.print("reason=");    Serial.print(b.reason);
+    Serial.print(' ');          Serial.print(reasonName(b.reason));
+    Serial.print("  window=");  Serial.print(b.start_us);
+    Serial.print("..");         Serial.print(b.end_us);
+    Serial.print("us/");        Serial.print(b.width_samples);
+    Serial.print("smp  primary=ch"); Serial.print(b.primary);
+    Serial.print("  mode=");
+    Serial.println(b.mode == (uint8_t)METRIC_MODE_LINKED ? "linked" : "per-channel");
+
+    for (uint8_t i = 0; i < b.n_channels; i++) {
+        const ChannelMetrics& c = rec.ch[i];
+        Serial.print("  ch");       Serial.print(c.channel);
+        if ((c.flags & CH_FLAG_PRESENT) == 0u) {
+            Serial.println("  absent");
+            continue;
+        }
+        Serial.print("  max=");     Serial.print(c.max_value);
+        Serial.print("  area=");    Serial.print((uint32_t)c.area);
+        Serial.print("  width=");   Serial.print(c.width_us);
+        Serial.print("us/");        Serial.print(c.width_samples);
+        Serial.print("smp  base="); Serial.print(c.baseline);
+        Serial.print("  ");
+        if (metricsValid(c.reason)) {
+            Serial.print("VALID");
+        } else {
+            Serial.print("rejected ");
+            Serial.print(reasonName(c.reason));
+        }
+        if ((c.flags & CH_FLAG_TRUNCATED) != 0u) { Serial.print("  [truncated]"); }
+        Serial.println();
+    }
 }
 
 // ===========================================================================
@@ -193,20 +219,25 @@ void setup() {
 #if SORTER_SIGNAL_GEN
         Serial.print("BENCH MODE: the M4 drives DAC A12/A13 with a known pattern at ");
         Serial.print(SORTER_SAMPLE_RATE_HZ);
-        Serial.print(" Hz, combining channel mask 0x");
+        Serial.print(" Hz, measuring channel mask 0x");
         Serial.print((unsigned)SORTER_ACTIVE_CHANNEL_MASK, HEX);
-        Serial.println('.');
-        Serial.println("Expected per 2 s pattern cycle: 3 VALID peaks + 3 rejected false peaks.");
+        Serial.print(" in ");
+        Serial.print(SORTER_METRIC_MODE ? "linked" : "per-channel");
+        Serial.print(" mode (primary channel ");
+        Serial.print(SORTER_PRIMARY_CHANNEL);
+        Serial.println(").");
+        Serial.println("Expected per 2 s pattern cycle: 3 VALID events (one 'ch' line per");
+        Serial.println("measured channel) + 3 rejected events.");
 #endif
     }
 }
 
 void loop() {
     if (RPC.cpu_id() == CM7_CPUID) {
-        PeakMetrics* m;
-        while ((m = g_m7Mail.try_get()) != nullptr) {
-            printMetrics(*m);
-            g_m7Mail.free(m);
+        EventRecord* r;
+        while ((r = g_m7Mail.try_get()) != nullptr) {
+            printBundle(*r);
+            g_m7Mail.free(r);
         }
         delay(1);
     } else {

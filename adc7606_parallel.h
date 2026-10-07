@@ -33,11 +33,6 @@ public:
     // two's-complement, as produced by the AD7606.
     void readAll(int32_t channels[AD7606_NUM_CHANNELS]);
 
-    // Convenience: convert + read + combine into a single sample the channels
-    // selected by SORTER_ACTIVE_CHANNEL_MASK (mean or sum, per
-    // SORTER_COMBINE_MEAN).
-    int32_t readCombined();
-
 private:
     void convstPulse();
     void waitReady();

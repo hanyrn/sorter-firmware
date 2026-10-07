@@ -97,22 +97,3 @@ void Adc7606Parallel::readAll(int32_t channels[AD7606_NUM_CHANNELS]) {
     }
     pinHigh(AD7606_CS_PORT, AD7606_CS_BIT);   // release both buses
 }
-
-int32_t Adc7606Parallel::readCombined() {
-    int32_t channels[AD7606_NUM_CHANNELS];
-    readAll(channels);
-    int64_t  sum = 0;
-    uint32_t n   = 0;
-    for (uint8_t i = 0; i < AD7606_NUM_CHANNELS; i++) {
-        if ((SORTER_ACTIVE_CHANNEL_MASK & (1uL << i)) != 0u) {
-            sum += channels[i];
-            n++;
-        }
-    }
-    if (n == 0u) { n = 1u; }   // guard against an empty channel mask
-#if SORTER_COMBINE_MEAN
-    return (int32_t)(sum / (int64_t)n);
-#else
-    return (int32_t)sum;
-#endif
-}

@@ -2,11 +2,12 @@
 
 Arduino **GIGA R1 WiFi** (STM32H747, dual-core) firmware that reads two **AD7606**
 modules over their **parallel buses** (one 16-bit bus per module, shared control
-lines; no SPI/serial protocol), combines the
-enabled ADC channels into one signal (all 16 in the real application; see
-`SORTER_ACTIVE_CHANNEL_MASK`), detects peak events on an adaptive baseline +
-standard deviation threshold, and reports per-event metrics (max value, area,
-width) to the Cortex-M7.
+lines; no SPI/serial protocol), runs one peak detector per enabled ADC channel
+(each with its own adaptive baseline + standard-deviation threshold; see
+`SORTER_ACTIVE_CHANNEL_MASK`), groups the per-channel results of one event into a
+single bundle — linked to a primary channel or timed per channel, see
+`SORTER_METRIC_MODE` — and reports the per-event metrics (height, width, area per
+channel) to the Cortex-M7.
 
 The whole acquisition + signal-processing pipeline runs on the **Cortex-M4**
 (240 MHz). The **Cortex-M7** (480 MHz) simply receives the metrics for now; the
@@ -19,12 +20,14 @@ with `RPC.cpu_id()` (`CM4_CPUID` / `CM7_CPUID`):
 
 | Core | Responsibility |
 |------|----------------|
-| **M4** | Drive the two AD7606 buses (shared control lines), read + combine 16 channels, run the event detector, push each closed event to the M7 |
-| **M7** | Receive event frames over the RPC raw endpoint and hand them to the application (currently printed to Serial) |
+| **M4** | Drive the two AD7606 buses (shared control lines), read the 16 channels, run one event detector per channel, group the per-channel results into one event bundle, push each closed event to the M7 |
+| **M7** | Receive event bundles over the RPC raw endpoint and hand them to the application (currently printed to Serial) |
 
-Inter-core transport uses the built-in `RPC` library (OpenAMP/rpmsg). Metrics
-travel as one fixed-size `sorter::PeakFrame` over the **raw** endpoint, because
-the RPC function dispatcher cannot carry this many fields as call arguments.
+Inter-core transport uses the built-in `RPC` library (OpenAMP/rpmsg). Each event
+travels as one `sorter::BundleFrame` over the **raw** endpoint: the event window
+plus one `ChannelMetrics` record per active channel (see *Metrics & inter-core
+frame* below), because the RPC function dispatcher cannot carry this many fields
+as call arguments.
 
 ### Flash split
 
@@ -42,17 +45,20 @@ does the **M7 pass first, then the M4 pass**, and why `-Split` exists.
 | File | Purpose |
 |------|---------|
 | `sorter-firmware.ino` | Entry points (`setup`/`loop`); M4 pipeline thread + M7 sink |
-| `config.h` | Pin map + detector tuning constants (Arduino side only) |
+| `config.h` | Pin map + detector/aggregator tuning constants (Arduino side only) |
 | `adc7606_parallel.{h,cpp}` | Register-level parallel-bus driver for the two modules |
-| `event_detector.h` | Hardware-independent event detector (unit-testable) |
-| `peak_metrics.h` | `PeakMetrics` / reason codes shared by both cores |
-| `metrics_sink.h` | M4→M7 metric frame encode/parse over the RPC raw endpoint |
+| `event_detector.h` | Hardware-independent single-channel event detector (unit-testable) |
+| `event_aggregator.h` | Groups the per-channel detectors into one event (LINKED / PER_CHANNEL) |
+| `peak_metrics.h` | `ChannelMetrics` / `EventBundle` / reason codes shared by both cores |
+| `metrics_sink.h` | M4→M7 event-bundle frame encode/parse over the RPC raw endpoint |
 | `signal_gen.{h,cpp}` | Bench-test synthetic signal generator (drives the two DACs) |
 | `flash.ps1` | Builds + uploads both GIGA cores (M7 first, then M4) over `arduino-cli` |
 | `monitor.ps1` | Opens a serial terminal on the board via `arduino-cli monitor` |
 | `test/model_check.py` | Python mirror of the detector + synthetic validation |
+| `test/model_check_aggregator.py` | Python mirror of the aggregator (LINKED / PER_CHANNEL) |
 | `test/test_event_detector.cpp` | C++ unit test for the detector (host) |
-| `test/run_tests.ps1` | Builds & runs the C++ unit test |
+| `test/test_event_aggregator.cpp` | C++ unit test for the aggregator (host) |
+| `test/run_tests.ps1` | Builds & runs the C++ unit tests |
 | `test/verify_adc_pinmap.ps1` | Checks the AD7606 pin map (config.h vs README vs GIGA core) |
 
 ## Wiring (suggested pin map)
@@ -245,7 +251,7 @@ not compatible with this driver).
 
 ## Detector algorithm (`event_detector.h`)
 
-For every combined sample `x` (the mean of the enabled channels):
+For every sample `x` of one channel (the detector runs once per channel):
 
 1. **Idle / warm-up**: keep a running estimate of the baseline (EMA mean) and the
    noise level (`sigma`, EMA of the variance). The reference is refreshed **only
@@ -268,6 +274,44 @@ Tuning lives in `config.h` (`DET_*` macros). The two EMA weights are deliberatel
 slow (`0.001`) — the tracker must be much slower than an event. If you change the
 sample rate or the expected event duration, revisit `baseline_alpha`/`noise_alpha`,
 `warmup_samples`, and the `DET_MIN_*` / `DET_MAX_SLOPE` bounds.
+
+## Event aggregation (`event_aggregator.h`)
+
+The detector above runs **once per channel**, so one physical event yields one set
+of metrics per channel. `EventAggregator` owns one `EventDetector` per channel,
+feeds them all from the same sample set, and turns the per-channel results into a
+single **event bundle** (`EventBundle` + one `ChannelMetrics` per active channel).
+How the channels are tied together is chosen in `config.h`:
+
+| `SORTER_METRIC_MODE` | Behaviour |
+|---|---|
+| `1` (linked, default) | The **primary channel** (`SORTER_PRIMARY_CHANNEL`) times the event: its own on/off crossing opens and closes the shared window. Every other channel's height/area is measured **inside that window only** (a channel that rises earlier or later is clipped and flagged `TRUNCATED`), and all channels report the primary's width — so one event has exactly one width. |
+| `0` (per-channel) | Every channel is timed on its own (own start/end/width, so widths may differ). The event is reported once **all** channels that entered it have closed; the detector's `max_width_samples` guard closes a channel that never returns, so an event can never hang. |
+
+In both modes the bundle carries the event window (start/end/width), the channel
+that resolved the verdict (`primary`) and the mode, plus one record per channel in
+`SORTER_ACTIVE_CHANNEL_MASK`. A channel that never rose is reported as absent
+(`flags == 0`), so it is not mistaken for a zero-height peak.
+
+Pick a primary (`SORTER_PRIMARY_CHANNEL`) that appears in **every** event; with the
+bench loopback that is channel 8 (the module-1 DAC input). Use `0` for per-channel
+mode (the primary is irrelevant there).
+
+## Metrics & inter-core frame (`peak_metrics.h`, `metrics_sink.h`)
+
+`metrics_sink.h` ships one closed event per raw RPC frame from the M4 to the M7:
+
+```
+uint16 magic | uint8 version | uint8 pad
+EventBundle   bundle                    (fixed header)
+ChannelMetrics ch[bundle.n_channels]    (one record per active channel)
+```
+
+`bundle.n_channels` fixes the payload length, so a 9-channel event fits comfortably
+and even the worst case (all 16 channels) stays inside the 512-byte RPMsg buffer.
+The M7 side validates magic/version/length in `parseBundle()` and rejects anything
+it does not understand, then hands the record to the application (for now it is
+printed to Serial; see `printBundle()` in `sorter-firmware.ino`).
 
 ## Build & upload
 
@@ -367,24 +411,30 @@ Notes:
   the floating data lines make the detector report noise.
 * The checked-in default is the **bench build** (`SORTER_SIGNAL_GEN 1`, DACs drive
   channels 0/8). Set it to `0` for the real application, where all 16 channels are
-  combined.
+  measured on their own.
 
 ## Testing
 
-The event detector has **no hardware dependency**, so it can be validated
-without the board:
+The detector and the aggregator have **no hardware dependency**, so both can be
+validated without the board:
 
-* **Python model check (no compiler needed)**
+* **Python model checks (no compiler needed)**
   ```powershell
-  py -3 test\model_check.py
+  py -3 test\model_check.py             # detector
+  py -3 test\model_check_aggregator.py  # aggregator (LINKED + PER_CHANNEL)
   ```
-  Mirrors the C++ detector and runs a synthetic signal (baseline + noise, three
-  broad peaks, two glitches); it should print `PASS`.
+  `model_check.py` mirrors the C++ detector and runs a synthetic signal (baseline +
+  noise, three broad peaks, two glitches). `model_check_aggregator.py` mirrors the
+  C++ aggregator and checks both modes: in LINKED every channel inherits the
+  primary's window, in PER_CHANNEL each channel keeps its own width. Both print
+  `PASS`.
 
-* **C++ unit test (needs g++/clang++)**
+* **C++ unit tests (need g++/clang++)**
   ```powershell
   pwsh test\run_tests.ps1
   ```
+  Builds and runs `test_event_detector` and `test_event_aggregator`; on a machine
+  with no compiler the script points at the two Python checks instead.
 
 * **Pin-map check (needs the `arduino:mbed_giga` core installed)**
   ```powershell
@@ -394,18 +444,18 @@ without the board:
   `variant.cpp`, checks that `README.md` lists the same pins in the same order,
   and fails if a pin is used twice or carries an on-board peripheral function.
 
-Both check the same scenario: the three broad peaks must be reported as VALID
-(max ~= 800, width ~= 1100 samples) and the two glitches rejected.
+The detector checks use the same scenario: the three broad peaks must be reported
+as VALID (max ~= 800, width ~= 1100 samples) and the two glitches rejected.
 
 ## Bench test: DAC → AD7606 loopback (hardware-in-the-loop)
 
 The GIGA's two 12-bit DAC outputs can generate a *known* waveform and feed it
 straight back into the AD7606 inputs, turning the complete chain (parallel bus →
-combine → detector → RPC → M7 printout) into a hardware-in-the-loop test of the
-peak detector. It is enabled by `SORTER_SIGNAL_GEN 1` in `config.h` (the current
-default): the M4 then drives the DACs once per conversion — **sample-locked to the
-ADC** — with the pattern in `signal_gen.cpp`, and combines only the driven
-channels.
+per-channel detector → aggregation → RPC → M7 printout) into a hardware-in-the-
+loop test of the peak detector. It is enabled by `SORTER_SIGNAL_GEN 1` in
+`config.h` (the current default): the M4 then drives the DACs once per conversion
+— **sample-locked to the ADC** — with the pattern in `signal_gen.cpp`, and
+measures only the driven channels.
 
 ### Wiring
 
@@ -482,16 +532,17 @@ baseline**, so peaks are positive excursions — exactly what the detector's
 ### Turning the bench test off
 
 Set `SORTER_SIGNAL_GEN 0` in `config.h`: the DACs are then never touched, the loop
-free-runs again, and all 16 channels are combined
+free-runs again, and all 16 channels are measured on their own
 (`SORTER_ACTIVE_CHANNEL_MASK` = `0xFFFF`) — the production configuration.
 
 ## Notes / next steps
 
 * The M4->M7 link currently only prints the metrics on the M7. The application
-  logic that consumes `PeakMetrics` is the next thing to add on the M7.
-* `AD7606_NUM_MODULES`/combining assumes both modules sense the same event; the
-  combined sample is the **mean** of the channels selected by
-  `SORTER_ACTIVE_CHANNEL_MASK` (`SORTER_COMBINE_MEAN`).
+  logic that consumes the `EventRecord` bundle is the next thing to add on the M7.
+* `AD7606_NUM_MODULES` assumes both modules sense the same event, so channel `n` of
+  module 0 and channel `n` of module 1 come from the same instant and can be
+  compared/differenced. Each channel is otherwise detected on its own — there is no
+  cross-channel average.
 * The loop is paced to `SORTER_SAMPLE_RATE_HZ` (10 kSPS by default) so the
   detector runs at the rate its bounds were written for. Set it to `0` to
   free-run: with no oversampling the AD7606 needs ~3.5 us per conversion plus
