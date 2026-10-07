@@ -37,6 +37,7 @@ the RPC function dispatcher cannot carry this many fields as call arguments.
 | `peak_metrics.h` | `PeakMetrics` / reason codes shared by both cores |
 | `metrics_sink.h` | M4→M7 metric frame encode/parse over the RPC raw endpoint |
 | `signal_gen.{h,cpp}` | Bench-test synthetic signal generator (drives the two DACs) |
+| `flash.ps1` | Builds + uploads both GIGA cores (M7 first, then M4) over `arduino-cli` |
 | `test/model_check.py` | Python mirror of the detector + synthetic validation |
 | `test/test_event_detector.cpp` | C++ unit test for the detector (host) |
 | `test/run_tests.ps1` | Builds & runs the C++ unit test |
@@ -275,6 +276,47 @@ arduino-cli upload  --fqbn "arduino:mbed_giga:giga:target_core=cm4" -p <PORT> .
 In VS Code this folder is an Arduino sketch (see `.vscode/arduino.json`); set the
 board to **Arduino GIGA R1 WiFi** and build/upload once with *Target core* =
 **Main Core**, then again with *Target core* = **M4 Co-processor**.
+
+### First-time setup (fresh board)
+
+On Windows the GIGA needs **no driver**: plug the USB-C cable into the
+**programming port** (the one next to the DC jack) and the board enumerates as
+`USB Serial Device (COMx)`, which `arduino-cli` identifies as `Arduino Giga R1`
+(`arduino:mbed_giga:giga`). The second USB-C port is the *native* port used by
+`USBHost`/`USBDevice` sketches and does **not** appear as a COM port.
+
+1. **Core** (once per machine):
+   ```powershell
+   arduino-cli core install arduino:mbed_giga
+   ```
+2. **Find the port** with the board plugged in:
+   ```powershell
+   arduino-cli board list      # -> COMx  Arduino Giga R1  arduino:mbed_giga:giga
+   ```
+3. **Flash both cores** with the helper script — it locates `arduino-cli` on
+   `PATH`, or the copy bundled with the *Arduino Maker Workshop* VS Code
+   extension when the CLI is not on `PATH`:
+   ```powershell
+   .\flash.ps1                 # M7 then M4, port auto-detected
+   .\flash.ps1 -SkipUpload     # compile check only, no board needed
+   .\flash.ps1 -Monitor        # ... and open the 115200 serial monitor
+   .\flash.ps1 -Port COM7      # if auto-detection picks the wrong port
+   ```
+4. **Verify** at **115200 baud**: the `BENCH MODE` banner at boot, then metric
+   lines whose `base=` reads ~5407 (±10 V) or ~10813 (±5 V) once the
+   DAC → AD7606 loopback in the next section is wired.
+
+Notes:
+
+* If an upload fails and the port disappears, the board is running a sketch rather
+  than the bootloader: **double-tap RESET** and upload again, selecting the
+  bootloader port that appears (usually a new `COMx`).
+* Flashing with no AD7606 modules attached still works — the BUSY wait has a
+  timeout — but you are then only testing the toolchain and the serial link, since
+  the floating data lines make the detector report noise.
+* The checked-in default is the **bench build** (`SORTER_SIGNAL_GEN 1`, DACs drive
+  channels 0/8). Set it to `0` for the real application, where all 16 channels are
+  combined.
 
 ## Testing
 
