@@ -27,6 +27,8 @@ enum PeakRejectReason : uint8_t {
     REASON_WIDTH_TOO_WIDE   = 3, // event never returned to the noise band (timeout)
     REASON_AREA_TOO_SMALL   = 4, // integrated area below the minimum
     REASON_SHORT_FOR_HEIGHT = 5, // width too short *for its height* (spike/glitch)
+    REASON_RAILED           = 6, // input was at/above the converter rail (saturated),
+                                 // so the reading is meaningless rather than a peak
 };
 
 struct PeakMetrics {
@@ -76,6 +78,8 @@ enum ChannelFlag : uint8_t {
     CH_FLAG_PRESENT   = 0x01, // channel rose above its own on-threshold in the window
     CH_FLAG_TRUNCATED = 0x02, // the window ended while the channel was still high
                               // (LINKED), or closed by the max_width guard (PER_CHANNEL)
+    CH_FLAG_RAILED    = 0x04, // this channel's input was saturated (see REASON_RAILED);
+                              // its detector was re-baselined and held off briefly
 };
 
 // Wire layout: packed, so both cores (and the host) agree byte for byte and a

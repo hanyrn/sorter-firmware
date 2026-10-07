@@ -10,7 +10,34 @@ foreach ($c in 'g++', 'clang++') {
     if (Get-Command $c -ErrorAction SilentlyContinue) { $cxx = $c; break }
 }
 if (-not $cxx) {
-    Write-Host 'No C++ compiler (g++/clang++) found on PATH.'
+    # Not on PATH: fall back to well-known install locations so the runner works
+    # even when the compiler was installed after the shell started.  In particular
+    # the WinLibs MinGW-w64 package installed through winget (...\WinGet\Packages\
+    # BrechtSanders.WinLibs.*\mingw64\bin) is not added to PATH automatically.
+    $candidates = @()
+    $wingetPkgs = Join-Path $env:LOCALAPPDATA 'Microsoft\WinGet\Packages'
+    if (Test-Path $wingetPkgs) {
+        $candidates += Get-ChildItem $wingetPkgs -Recurse -Filter 'g++.exe' -ErrorAction SilentlyContinue |
+            Select-Object -ExpandProperty FullName
+    }
+    $candidates += @(
+        'C:\msys64\mingw64\bin\g++.exe',
+        'C:\mingw64\bin\g++.exe',
+        'C:\ProgramData\mingw64\bin\g++.exe'
+    )
+    foreach ($cand in $candidates) {
+        if (Test-Path $cand) {
+            $cxx = $cand
+            # Prepend its folder so g++ can also find its own runtime DLLs.
+            $env:PATH = (Split-Path $cand) + ';' + $env:PATH
+            Write-Host "Using compiler: $cand"
+            break
+        }
+    }
+}
+if (-not $cxx) {
+    Write-Host 'No C++ compiler (g++/clang++) found on PATH or in the usual install locations.'
+    Write-Host 'Install one, e.g.:  winget install BrechtSanders.WinLibs.POSIX.UCRT'
     Write-Host 'On this machine you can still validate the algorithms with:'
     Write-Host '    py -3 test\model_check.py'
     Write-Host '    py -3 test\model_check_aggregator.py'

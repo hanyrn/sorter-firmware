@@ -97,6 +97,9 @@ static EventAggregator::Config makeAggregatorConfig() {
     c.channel_mask = SORTER_ACTIVE_CHANNEL_MASK;
     c.mode         = SORTER_METRIC_MODE ? METRIC_MODE_LINKED : METRIC_MODE_PER_CHANNEL;
     c.primary      = (uint8_t)SORTER_PRIMARY_CHANNEL;
+    c.rail_level    = DET_RAIL_LEVEL;
+    c.rail_width    = DET_RAIL_WIDTH;
+    c.rail_cooldown = DET_RAIL_COOLDOWN;
     return c;
 }
 
@@ -125,6 +128,13 @@ static void acquisitionTask() {
 #endif
 
         g_adc.readAll(channels);
+
+        // Some channels idle HIGH and dip when an event occurs (see
+        // SORTER_INVERT_CHANNEL_MASK): invert them so the one rising-edge peak
+        // detector fits every channel. This runs before detection, so both the
+        // per-channel detectors and the aggregator's window logic see the same
+        // (inverted) value.
+        applyInputPolarity(channels, SORTER_INVERT_CHANNEL_MASK);
 
         // Every channel is measured on its own; a completed event carries one
         // record per active channel and is handed to the M7 in a single frame.
@@ -161,6 +171,7 @@ static const char* reasonName(uint8_t reason) {
         case REASON_WIDTH_TOO_WIDE:   return "WIDTH_TOO_WIDE";
         case REASON_AREA_TOO_SMALL:   return "AREA_TOO_SMALL";
         case REASON_SHORT_FOR_HEIGHT: return "SHORT_FOR_HEIGHT";
+        case REASON_RAILED:           return "RAILED";
         default:                      return "UNKNOWN";
     }
 }
@@ -180,9 +191,18 @@ static void printBundle(const EventRecord& rec) {
     Serial.print("  mode=");
     Serial.println(b.mode == (uint8_t)METRIC_MODE_LINKED ? "linked" : "per-channel");
 
+    if (b.reason == REASON_RAILED) {
+        Serial.println("*** SIGNAL TOO BRIGHT: an input railed (saturated). Reduce the "
+                       "source intensity; that channel's detector was reset. ***");
+    }
+
     for (uint8_t i = 0; i < b.n_channels; i++) {
         const ChannelMetrics& c = rec.ch[i];
         Serial.print("  ch");       Serial.print(c.channel);
+        if ((c.flags & CH_FLAG_RAILED) != 0u) {
+            Serial.println("  RAILED (input saturated)");
+            continue;
+        }
         if ((c.flags & CH_FLAG_PRESENT) == 0u) {
             Serial.println("  absent");
             continue;

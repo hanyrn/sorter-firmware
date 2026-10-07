@@ -126,6 +126,33 @@ public:
 
     void configure(const Config& c) { cfg_ = c; reset(); }
 
+    // Re-seed the running mean from the current sample and drop any event in
+    // progress, so the detector resumes immediately (without re-running warm-up).
+    // Used when a channel has been saturated (railed): its readings were
+    // meaningless, so the stale reference is discarded instead of being allowed to
+    // bias the next event.
+    //
+    // The noise estimate (var_/sigma_) is deliberately KEPT: saturating the input
+    // does not change the channel's noise floor, and a freshly seeded (too small)
+    // sigma would put the threshold far too low and make the detector chatter on
+    // noise until the slow EMA re-converged. `samples_seen_` is left at (or pushed
+    // to) the warm-up count so the detector does not fall back to STATE_WARMUP.
+    void rebaseline(int32_t x) {
+        mean_           = (float)x;
+        primed_         = true;
+        state_          = STATE_IDLE;
+        base_at_start_  = x;
+        sigma_at_start_ = sigma_;
+        ev_start_us_    = 0;
+        ev_start_index_ = 0;
+        ev_samples_     = 0;
+        ev_peak_us_     = 0;
+        ev_max_         = 0;
+        ev_area_        = 0;
+        below_count_    = 0;
+        if (samples_seen_ < cfg_.warmup_samples) { samples_seen_ = cfg_.warmup_samples; }
+    }
+
     const Config& config() const { return cfg_; }
     Config&       config()       { return cfg_; }
 

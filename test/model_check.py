@@ -20,6 +20,7 @@ REASON_WIDTH_TOO_NARROW = 2
 REASON_WIDTH_TOO_WIDE = 3
 REASON_AREA_TOO_SMALL = 4
 REASON_SHORT_FOR_HEIGHT = 5
+REASON_RAILED = 6
 
 WARMUP, IDLE, EVENT = 0, 1, 2
 
@@ -63,6 +64,26 @@ class EventDetector:
         self.below_count = 0
         self.counter = 0
         self.primed = False
+
+    def rebaseline(self, x):
+        """Mirror of EventDetector::rebaseline(): re-seed the mean from the current
+        sample and drop any event in progress, without re-running warm-up.  The
+        noise estimate (var/sigma) is kept - saturating the input does not change
+        the channel's noise floor."""
+        self.mean = float(x)
+        self.primed = True
+        self.state = IDLE
+        self.base_at_start = x
+        self.sigma_at_start = self.sigma
+        self.ev_start_us = 0
+        self.ev_start_index = 0
+        self.ev_samples = 0
+        self.ev_peak_us = 0
+        self.ev_max = 0
+        self.ev_area = 0
+        self.below_count = 0
+        if self.samples_seen < self.cfg.warmup_samples:
+            self.samples_seen = self.cfg.warmup_samples
 
     def _update_baseline(self, x):
         if not self.primed:

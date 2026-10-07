@@ -360,10 +360,104 @@ static void testPerChannel() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 4. LINKED: the primary rails -> one notification bundle, then it recovers
+// ---------------------------------------------------------------------------
+static void testRail() {
+    g_rng = 0x12345678u;
+    EventAggregator agg(aggConfig(METRIC_MODE_LINKED, 0x0103u, 8));
+
+    int events = 0, rails = 0, valid = 0;
+    for (int i = 0; i < 14000; i++) {
+        int32_t v[SORTER_MAX_CHANNELS];
+        for (int c = 0; c < SORTER_MAX_CHANNELS; c++) { v[c] = 0; }
+        v[0] = (int32_t)std::lround(2000.0 + gauss() * 5.0);
+        v[1] = (int32_t)std::lround(2000.0 + gauss() * 5.0);
+
+        double x8 = 2000.0 + gauss() * 5.0;
+        if (i >= 4000 && i < 4200) { x8 = 32700.0; }            // bright burst: saturates
+        if (i >= 8000 && i < 10000) {                           // normal peak after recovery
+            const double d = (double)(i - 9000);
+            x8 += 800.0 * std::exp(-(d * d) / (2.0 * 200.0 * 200.0));
+        }
+        v[8] = (int32_t)std::lround(x8);
+
+        EventRecord rec;
+        if (agg.update(v, (uint32_t)i * 10u, (uint32_t)i, rec)) {
+            events++;
+            if (rec.bundle.reason == REASON_RAILED) {
+                rails++;
+                CHECK(rec.bundle.valid == 0, "rail: valid=%u, expected 0",
+                      (unsigned)rec.bundle.valid);
+                CHECK(rec.bundle.n_channels == 3, "rail: %u records, expected 3",
+                      (unsigned)rec.bundle.n_channels);
+                const ChannelMetrics* c8 = findChannel(rec, 8);
+                const ChannelMetrics* c0 = findChannel(rec, 0);
+                CHECK(c8 && c8->flags == CH_FLAG_RAILED && c8->reason == REASON_RAILED,
+                      "rail: ch8 not flagged RAILED (flags=0x%02x reason=%u)",
+                      c8 ? (unsigned)c8->flags : 0u, c8 ? (unsigned)c8->reason : 0u);
+                CHECK(c0 && c0->flags == 0 && c0->reason == REASON_MAX_TOO_SMALL,
+                      "rail: ch0 should be absent in the rail bundle");
+            } else if (rec.bundle.valid) {
+                valid++;
+                const ChannelMetrics* c8 = findChannel(rec, 8);
+                CHECK(c8 && near(c8->max_value, 650, 950),
+                      "rail: post-recovery height %d, expected ~800",
+                      c8 ? (int)c8->max_value : -1);
+            }
+        }
+    }
+    CHECK(rails == 1, "rail: %d rail bundles, expected exactly 1", rails);
+    CHECK(valid == 1, "rail: %d valid events after recovery, expected 1", valid);
+    CHECK(events <= 4, "rail: %d events total - detector is chattering", events);
+    std::printf("LINKED rail: %d events (%d rail, %d valid)\n", events, rails, valid);
+}
+
+// ---------------------------------------------------------------------------
+// 5. An inverted channel (idles high, dips on an event) measured as a peak
+// ---------------------------------------------------------------------------
+static void testInvert() {
+    g_rng = 0x12345678u;
+    EventAggregator agg(aggConfig(METRIC_MODE_LINKED, (1u << 8), 8));
+
+    int events = 0, valid = 0;
+    for (int i = 0; i < 20000; i++) {
+        int32_t v[SORTER_MAX_CHANNELS];
+        for (int c = 0; c < SORTER_MAX_CHANNELS; c++) { v[c] = 0; }
+
+        double x8 = 25000.0 + gauss() * 5.0;                    // idles HIGH ...
+        for (int k = 0; k < 2; k++) {                           // ... dips on an event
+            const int    center = (k == 0) ? 6000 : 13000;
+            const double d = (double)(i - center);
+            x8 -= 800.0 * std::exp(-(d * d) / (2.0 * 200.0 * 200.0));
+        }
+        v[8] = (int32_t)std::lround(x8);
+
+        applyInputPolarity(v, (1u << 8));                       // the fix under test
+
+        EventRecord rec;
+        if (agg.update(v, (uint32_t)i * 10u, (uint32_t)i, rec)) {
+            events++;
+            if (rec.bundle.valid) {
+                valid++;
+                const ChannelMetrics* c8 = findChannel(rec, 8);
+                CHECK(c8 && near(c8->max_value, 600, 1000),
+                      "invert: ch8 height %d, expected ~800 (the dip depth)",
+                      c8 ? (int)c8->max_value : -1);
+            }
+        }
+    }
+    CHECK(events == 2, "invert: %d events, expected 2", events);
+    CHECK(valid == 2, "invert: %d valid events, expected 2", valid);
+    std::printf("INVERT: %d events (dips detected as peaks)\n", events);
+}
+
 int main() {
     testLinked();
     testLinkedClip();
     testPerChannel();
+    testRail();
+    testInvert();
 
     if (g_failures > 0) {
         std::printf("\nFAILED: %d check(s)\n", g_failures);

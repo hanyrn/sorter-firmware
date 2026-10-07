@@ -70,6 +70,20 @@
 #define SORTER_METRIC_MODE     1
 #define SORTER_PRIMARY_CHANNEL 8
 
+// Per-channel input polarity: bit i = 1 means channel i is measured inverted.  The
+// primary channel (the 9th, index 8) idles HIGH and DIPS when an event occurs -
+// the opposite of the other eight channels - so it is inverted here and then
+// handled by the very same rising-edge peak logic (its height/area then read as
+// the dip depth).  Clear a bit for any channel that rises like the majority.
+//
+// In the bench loopback BOTH DACs output the same (positive) waveform, so no
+// channel is inverted there - otherwise the injected peaks would be flipped.
+#if SORTER_SIGNAL_GEN
+  #define SORTER_INVERT_CHANNEL_MASK  0u
+#else
+  #define SORTER_INVERT_CHANNEL_MASK  (1u << SORTER_PRIMARY_CHANNEL)
+#endif
+
 // ===========================================================================
 // AD7606 parallel buses -- Arduino GIGA R1 WiFi digital pins
 // ===========================================================================
@@ -199,6 +213,16 @@ static const uint8_t AD7606_BUSY1_PIN  = A5;
 #define DET_MAX_WIDTH_SAMPLES  200000u
 #define DET_MIN_AREA           0ull
 #define DET_MAX_SLOPE          100.0f
+
+// Saturation ("rail") guard.  A bright source drives an AD7606 input past its
+// range, where the reading clips at full scale: nothing can be measured there, so
+// the channel is taken out of detection and its detector re-baselined.  A channel
+// is declared railed after DET_RAIL_WIDTH consecutive samples at or beyond
+// +/-DET_RAIL_LEVEL counts, then held out for DET_RAIL_COOLDOWN samples.  The M7
+// is told once per rail episode (SIGNAL TOO BRIGHT) so the operator can act.
+#define DET_RAIL_LEVEL         32000   // |sample| >= this = saturated (counts, +/-10 V)
+#define DET_RAIL_WIDTH         8       // consecutive saturated samples to declare a rail
+#define DET_RAIL_COOLDOWN      1000    // samples a railed channel is held out of detection
 
 // ===========================================================================
 // Synthetic signal generator (bench test only, SORTER_SIGNAL_GEN = 1)

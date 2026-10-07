@@ -33,6 +33,7 @@ MODE_LINKED = 1
 
 CH_FLAG_PRESENT = 0x01
 CH_FLAG_TRUNCATED = 0x02
+CH_FLAG_RAILED = 0x04
 
 MAX_CH = 16
 
@@ -40,6 +41,17 @@ MAX_CH = 16
 def rint(f):
     """C's lroundf(): round half away from zero."""
     return int(math.floor(f + 0.5)) if f >= 0 else -int(math.floor(-f + 0.5))
+
+
+def apply_input_polarity(channels, invert_mask):
+    """Mirror of applyInputPolarity(): negate every channel whose bit is set.
+
+    A channel that idles HIGH and dips on an event (the primary / 9th here) is
+    inverted so the rising-edge peak logic measures it like the others.
+    """
+    for ch in range(MAX_CH):
+        if invert_mask & (1 << ch):
+            channels[ch] = -channels[ch]
 
 
 def classify_peak(cfg, max_value, width_samples, area):
@@ -64,6 +76,10 @@ class AggConfig:
         self.channel_mask = 0x0000FFFF
         self.mode = MODE_LINKED
         self.primary = 0xFF
+        # saturation ("rail") guard: |sample| >= rail_level is clipped at full scale
+        self.rail_level = 32000
+        self.rail_width = 8
+        self.rail_cooldown = 1000
 
 
 class EventAggregator:
@@ -96,15 +112,65 @@ class EventAggregator:
         self.pc_start_ix = 0
         self.pc_metrics = [None] * MAX_CH
         self.pc_done = [False] * MAX_CH
+        self.pc_in = [False] * MAX_CH
+        self.rail_count = [0] * MAX_CH
+        self.rail_holdoff = [0] * MAX_CH
+        self.rail_skip = [False] * MAX_CH
+        self.ch_railed = [False] * MAX_CH
+        self.rail_notified = False
 
     def in_mask(self, ch):
         return (self.cfg.channel_mask & (1 << ch)) != 0
 
     def update(self, channels, t_us, index):
+        # ---- saturation ("rail") guard: runs before any detection -------------
+        rail_new = False     # a channel was declared railed on THIS sample
+        any_busy = False     # some channel is currently railed / held off
+        for ch in range(MAX_CH):
+            self.rail_skip[ch] = False
+            if not self.in_mask(ch):
+                continue
+            mag = -channels[ch] if channels[ch] < 0 else channels[ch]
+
+            if self.rail_holdoff[ch] > 0:
+                self.rail_skip[ch] = True          # held out of detection
+                any_busy = True
+                if mag >= self.cfg.rail_level:
+                    self.rail_holdoff[ch] = self.cfg.rail_cooldown   # still bright
+                else:
+                    self.rail_holdoff[ch] -= 1
+                    if self.rail_holdoff[ch] == 0:
+                        self.det[ch].rebaseline(channels[ch])        # settled: resume
+                continue
+
+            if mag >= self.cfg.rail_level:
+                self.rail_skip[ch] = True
+                any_busy = True
+                self.rail_count[ch] += 1
+                if self.rail_count[ch] >= self.cfg.rail_width:
+                    self.rail_count[ch] = 0
+                    self.rail_holdoff[ch] = self.cfg.rail_cooldown
+                    self.ch_railed[ch] = True
+                    rail_new = True
+            else:
+                self.rail_count[ch] = 0
+
         if self.cfg.mode == MODE_LINKED:
             rec = self.update_linked(channels, t_us, index)
         else:
             rec = self.update_per_channel(channels, t_us, index)
+
+        # ---- rail notification: exactly one bundle per rail episode ----------
+        if rail_new and not self.rail_notified:
+            self.rail_notified = True
+            if self.cfg.mode == MODE_LINKED:
+                self.win_open = False
+            rec = self.build_rail_record(t_us)
+        if not any_busy:
+            self.rail_notified = False
+            for ch in range(MAX_CH):
+                self.ch_railed[ch] = False
+
         if rec is not None:
             rec["bundle"]["index"] = self.counter
             self.counter += 1
@@ -116,9 +182,14 @@ class EventAggregator:
             return None
 
         for ch in range(MAX_CH):
-            if ch == self.primary or not self.in_mask(ch):
+            if ch == self.primary or not self.in_mask(ch) or self.rail_skip[ch]:
                 continue
             self.det[ch].update(channels[ch], t_us, index)   # keep the reference alive
+
+        # A railed primary cannot time the window: update() flushes it as a rail
+        # notification, so just report "nothing closed" here.
+        if self.rail_skip[self.primary]:
+            return None
 
         was_in = self.det[self.primary].state == mc.EVENT
         ref = self.det[self.primary].update(channels[self.primary], t_us, index)
@@ -202,13 +273,23 @@ class EventAggregator:
         for ch in range(MAX_CH):
             if not self.in_mask(ch):
                 continue
+            if self.rail_skip[ch]:
+                # Railed/held off: cannot close on its own, so drop it from the open
+                # group (its rail bundle is emitted by update()) to avoid a hang.
+                if self.pc_in[ch]:
+                    self.pc_in[ch] = False
+                    if self.pc_pending > 0:
+                        self.pc_pending -= 1
+                continue
             was_in = self.det[ch].state == mc.EVENT
             m = self.det[ch].update(channels[ch], t_us, index)
             if not was_in and self.det[ch].state == mc.EVENT:
                 opened |= (1 << ch)
+                self.pc_in[ch] = True
             if m is not None:
                 closed |= (1 << ch)
                 self.pc_metrics[ch] = m
+                self.pc_in[ch] = False
 
         done = False
         if closed != 0:
@@ -270,6 +351,29 @@ class EventAggregator:
             "n_channels": len(chans), "valid": valid, "reason": reason,
         }
         self.pc_pending = 0
+        return {"bundle": bundle, "ch": chans}
+
+    # -- RAIL: one notification bundle per rail episode ----------------------
+    def build_rail_record(self, t_us):
+        chans = []
+        for ch in range(MAX_CH):
+            if not self.in_mask(ch):
+                continue
+            flags = 0
+            reason = mc.REASON_MAX_TOO_SMALL
+            if self.ch_railed[ch]:
+                flags = CH_FLAG_RAILED
+                reason = mc.REASON_RAILED
+            chans.append({
+                "channel": ch, "flags": flags, "reason": reason,
+                "baseline": rint(self.det[ch].mean), "max_value": 0,
+                "width_samples": 0, "width_us": 0, "area": 0,
+            })
+        bundle = {
+            "start_us": t_us, "end_us": t_us, "width_samples": 0, "width_us": 0,
+            "primary": self.primary, "mode": self.cfg.mode,
+            "n_channels": len(chans), "valid": 0, "reason": mc.REASON_RAILED,
+        }
         return {"bundle": bundle, "ch": chans}
 
 
@@ -498,8 +602,106 @@ def test_per_channel():
     return failures
 
 
+# ===========================================================================
+# scenario 4: LINKED, the primary rails -> one notification, then recovers
+# ===========================================================================
+def test_rail():
+    cfg = AggConfig()
+    cfg.mode = MODE_LINKED
+    cfg.channel_mask = 0x0103          # ch0, ch1, ch8
+    cfg.primary = 8
+
+    def levels(i, gauss):
+        base0 = 2000.0 + gauss() * 5.0
+        base1 = 2000.0 + gauss() * 5.0
+        base8 = 2000.0 + gauss() * 5.0
+        if 4000 <= i < 4200:                       # bright burst: ch8 saturates
+            base8 = 32700.0
+        if 8000 <= i < 10000:                      # a normal peak after recovery
+            base8 += gaussian_peak(i, 9000, 200, 800.0)
+        return {0: base0, 1: base1, 8: base8}
+
+    agg = EventAggregator(cfg)
+    events = run(agg, sample(14000, 10, levels))
+    failures = []
+
+    rails = [r for r in events if r["bundle"]["reason"] == mc.REASON_RAILED]
+    valid = [r for r in events if r["bundle"]["valid"] == 1]
+    if len(rails) != 1:
+        failures.append("rail: %d rail bundles, expected exactly 1" % len(rails))
+    if len(valid) != 1:
+        failures.append("rail: %d valid events after recovery, expected 1" % len(valid))
+
+    for rec in rails:
+        b = rec["bundle"]
+        if b["valid"] != 0:
+            failures.append("rail: valid=%d, expected 0" % b["valid"])
+        if b["n_channels"] != 3:
+            failures.append("rail: %d records, expected 3" % b["n_channels"])
+        c8 = ch_by_id(rec["ch"], 8)
+        c0 = ch_by_id(rec["ch"], 0)
+        if c8 is None or c8["flags"] != CH_FLAG_RAILED or c8["reason"] != mc.REASON_RAILED:
+            failures.append("rail: ch8 not flagged RAILED")
+        if c0 is not None and (c0["flags"] != 0 or c0["reason"] != mc.REASON_MAX_TOO_SMALL):
+            failures.append("rail: ch0 should be absent in the rail bundle")
+
+    if len(events) > 4:
+        failures.append("rail: %d events total - detector is chattering after the rail"
+                        % len(events))
+
+    print("RAIL: %d events (%d rail, %d valid)" % (len(events), len(rails), len(valid)))
+    return failures
+
+
+# ===========================================================================
+# scenario 5: an inverted channel (idles high, dips) is measured like the rest
+# ===========================================================================
+def test_invert():
+    cfg = AggConfig()
+    cfg.mode = MODE_LINKED
+    cfg.channel_mask = (1 << 8)
+    cfg.primary = 8
+
+    DIP = 800.0
+
+    def levels(i, gauss):
+        v = 25000.0 + gauss() * 5.0                 # idles HIGH ...
+        for c in (6000, 13000):
+            v -= gaussian_peak(i, c, 200, DIP)      # ... and dips on an event
+        return {8: v}
+
+    agg = EventAggregator(cfg)
+    failures = []
+    events = []
+    for idx, (vals, t) in enumerate(sample(20000, 10, levels)):
+        apply_input_polarity(vals, 1 << 8)          # the fix under test
+        rec = agg.update(vals, t, idx)
+        if rec is not None:
+            events.append(rec)
+
+    if len(events) != 2:
+        failures.append("invert: %d events, expected 2" % len(events))
+    for rec in events:
+        b = rec["bundle"]
+        c8 = ch_by_id(rec["ch"], 8)
+        if b["valid"] != 1:
+            failures.append("invert: event %d valid=%d, expected 1 (dip -> peak)"
+                            % (b["index"], b["valid"]))
+        if c8 is None or not (600 <= c8["max_value"] <= 1000):
+            failures.append("invert: event %d ch8 height %s, expected ~%d (dip depth)"
+                            % (b["index"], None if c8 is None else c8["max_value"], int(DIP)))
+
+    print("INVERT: %d events (dips detected as peaks)" % len(events))
+    for rec in events:
+        b = rec["bundle"]
+        c8 = ch_by_id(rec["ch"], 8)
+        print("  #%d valid=%d ch8 h=%d" % (b["index"], b["valid"], c8["max_value"]))
+    return failures
+
+
 def main():
-    failures = test_linked() + test_linked_clip() + test_per_channel()
+    failures = (test_linked() + test_linked_clip() + test_per_channel() +
+                test_rail() + test_invert())
     if failures:
         print("\nFAIL:")
         for f in failures:

@@ -298,6 +298,34 @@ Pick a primary (`SORTER_PRIMARY_CHANNEL`) that appears in **every** event; with 
 bench loopback that is channel 8 (the module-1 DAC input). Use `0` for per-channel
 mode (the primary is irrelevant there).
 
+## Saturation ("rail") guard and channel polarity
+
+Two input-condition concerns are handled in `EventAggregator::update()` **before**
+the per-channel metrics are assembled:
+
+* **Saturation (rail).** A source that is *too bright* drives an AD7606 input past
+  its range, where the reading clips at full scale and nothing can be measured.
+  Whenever `|x| >= DET_RAIL_LEVEL` for `DET_RAIL_WIDTH` consecutive samples, the
+  channel is declared **railed**: it is taken out of detection (its detector is fed
+  no more samples) and the M4 sends one **rail bundle** for the episode —
+  `bundle.reason = REASON_RAILED`, `bundle.valid = 0`, and the railed channel(s)
+  carry `CH_FLAG_RAILED`. The M7 prints `*** SIGNAL TOO BRIGHT ***`, the operator's
+  cue to reduce the source intensity. The channel stays held while the input remains
+  bright; once the signal returns to range the stale reference is discarded (the
+  detector is re-baselined, *keeping* its noise estimate so it does not chatter) and
+  detection resumes. The notification is emitted once per rail episode (re-armed
+  only after every channel has recovered), so a stuck-bright source cannot flood the
+  link. Tune with `DET_RAIL_LEVEL` / `DET_RAIL_WIDTH` / `DET_RAIL_COOLDOWN`.
+
+* **Channel polarity.** Some channels idle HIGH and *dip* when an event occurs — in
+  the real application the primary (9th) channel, index 8, is the complement of the
+  other eight. `SORTER_INVERT_CHANNEL_MASK` (bit i = channel i) negates those
+  channels right after the ADC read (see `applyInputPolarity()`), so the same
+  rising-edge detector fits every channel; the inverted channel's reported height
+  and area then read as the **dip depth**. Set a bit for any channel that behaves
+  this way, clear it for the rest. (In the bench loopback both DACs share one
+  positive waveform, so the mask is `0` there.)
+
 ## Metrics & inter-core frame (`peak_metrics.h`, `metrics_sink.h`)
 
 `metrics_sink.h` ships one closed event per raw RPC frame from the M4 to the M7:
@@ -447,8 +475,13 @@ validated without the board:
   ```powershell
   pwsh test\run_tests.ps1
   ```
-  Builds and runs `test_event_detector` and `test_event_aggregator`; on a machine
-  with no compiler the script points at the two Python checks instead.
+  Builds and runs `test_event_detector` and `test_event_aggregator` against the real
+  headers. If `g++`/`clang++` is not on `PATH`, the script also looks in the usual
+  install locations (the winget WinLibs package, MSYS2, MinGW-w64) — install one with
+  `winget install BrechtSanders.WinLibs.POSIX.UCRT` if needed. If PowerShell refuses
+  to run the script, use `powershell -ExecutionPolicy Bypass -File test\run_tests.ps1`.
+  On a machine with no compiler at all the script points at the two Python checks
+  instead.
 
 * **Pin-map check (needs the `arduino:mbed_giga` core installed)**
   ```powershell
