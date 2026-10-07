@@ -51,54 +51,97 @@
 #endif
 
 // ===========================================================================
-// AD7606 parallel bus -- Arduino GIGA R1 WiFi digital pins
+// AD7606 parallel buses -- Arduino GIGA R1 WiFi digital pins
 // ===========================================================================
 //
-// Two AD7606 modules share ONE 16-bit data bus; each module drives the bus only
-// while its own CS is asserted.  Both modules are started simultaneously with a
-// shared CONVST so that all 16 detectors sample the same instant.
+// TWO independent 16-bit data buses, ONE set of shared control lines:
 //
-// Data bus (MCU inputs):
-//   DB0..DB7   -> PJ0..PJ7  (D25 D27 D29 D31 D33 D35 D37 D38)
-//   DB8..DB15  -> PK0..PK7  (D48 D10 D52 D30 D32 D34 D36 D41)
-// => the whole 16-bit word is captured with two register reads (see readBus()).
+//   * every module keeps its OWN DB0..DB15, so both 16-bit words are on the
+//     GIGA at the same time and the modules can never fight over a bus (no
+//     three-state timing, no per-module CS sequencing);
+//   * CONVST / RESET / RD / CS are *tied together* and driven by one GIGA pin
+//     each, so both modules convert, reset and shift out their data on exactly
+//     the same edges.  Channel n of module 0 and channel n of module 1 are
+//     therefore latched in the same RD cycle -> the 16 channels are one
+//     snapshot of the same instant;
+//   * BUSY stays per module: BUSY is a push-pull *output* on the module side,
+//     so BUSY0/BUSY1 must never be tied to each other (that shorts drivers).
 //
-// Control lines (MCU outputs unless noted):
-//   CONVST  D22 = PJ12   (shared, rising edge starts conversion on both modules)
-//   RESET   D23 = PG13   (shared)
-//   RD      D24 = PG12   (shared; module selected via CS)
-//   CS0     D26 = PJ14   (module 0 select)
-//   CS1     D28 = PJ15   (module 1 select)
-//   BUSY0   D39 = PI14   (input, module 0 end-of-conversion)
-//   BUSY1   D42 = PI15   (input, module 1 end-of-conversion)
-//   OS0..2  tie to GND   (no oversampling = maximum sample rate)
+// Data lines (MCU inputs, 2 x 16 = 32 lines): the GIGA digital block
+// D22..D53 -- one 16-line run per module (one 16-way header / ribbon each):
+//   module 0  DB0..DB15  -> D22 D23 D24 D25 D26 D27 D28 D29 D30 D31 D32 D33
+//                           D34 D35 D36 D37
+//   module 1  DB0..DB15  -> D38 D39 D40 D41 D42 D43 D44 D45 D46 D47 D48 D49
+//                           D50 D51 D52 D53
+//
+// Control lines (shared, MCU outputs unless noted): the analog pins A0..A5, so
+// the whole control set sits on the analog header instead of the digital block.
+//   CONVST  A0 = PC4    (rising edge starts the conversion on both modules)
+//   RESET   A1 = PC5
+//   RD      A2 = PB0    (one strobe advances BOTH modules to the next channel)
+//   CS      A3 = PB1    (shared: asserted for the whole 8-strobe burst)
+//   BUSY0   A4 = PC3    (input, module 0 end-of-conversion)
+//   BUSY1   A5 = PC2    (input, module 1 end-of-conversion)
+//   OS0..2  tie to GND  (no oversampling = maximum sample rate)
+//
+// The remaining module pins are static straps and are NOT wired to the MCU:
+// RANGE selects +/-5 V (tie GND) or +/-10 V (tie 3.3 V) on BOTH modules (see
+// SIGNALGEN_ADC_PER_DAC below), CONVST A and CONVST B are tied together per
+// module, FRSTDATA is an unused output, VDRIVE must be 3.3 V and PAR/SER must be
+// low.  See README, "Module silkscreen -> AD7606 pin".
+//
+// 38 GIGA pins total: 32 data lines on the digital block D22..D53 plus the six
+// control/BUSY lines on A0..A5.  All of them are plain GPIOs (no peripheral
+// defaults; A0..A5 are ADC1 inputs that also work as digital I/O).  A6/A7 stay
+// free, and A12/A13 stay reserved for the bench-test DACs.  Any other free pin
+// works too - the read path only needs the (port, bit) of each line, see
+// AD7606_DB_LINES below.
 // ---------------------------------------------------------------------------
 
 #define AD7606_NUM_MODULES    2
 #define AD7606_CH_PER_MODULE  8
 #define AD7606_NUM_CHANNELS    (AD7606_NUM_MODULES * AD7606_CH_PER_MODULE)
 
-// Data bus as two contiguous 8-bit port fields.
-#define AD7606_DB_LOW_PORT    GPIOJ
-#define AD7606_DB_LOW_MASK    0x00FFu   // PJ0..PJ7
-#define AD7606_DB_HIGH_PORT   GPIOK
-#define AD7606_DB_HIGH_MASK   0x00FFu   // PK0..PK7
+// DB0..DB15 per module, and the total number of data lines on the GIGA.
+#define AD7606_DB_PER_MODULE  16
+#define AD7606_NUM_DB_LINES   (AD7606_NUM_MODULES * AD7606_DB_PER_MODULE)
+
+// One data line: 'pin' is the Arduino number (used once for pinMode() in
+// begin()); 'port'/'bit' are what the acquisition loop reads (port->IDR).
+struct Ad7606DbLine {
+    uint8_t       pin;
+    GPIO_TypeDef* port;
+    uint8_t       bit;
+};
+
+// Bit i of the word read from a module is its DB_i line.
+// Entries 0..15 = module 0 DB0..DB15, entries 16..31 = module 1 DB0..DB15.
+static const Ad7606DbLine AD7606_DB_LINES[AD7606_NUM_DB_LINES] = {
+    // ---- module 0 : GIGA D22..D37 ---------------------------------------
+    { D22, GPIOJ, 12 }, { D23, GPIOG, 13 }, { D24, GPIOG, 12 }, { D25, GPIOJ,  0 },
+    { D26, GPIOJ, 14 }, { D27, GPIOJ,  1 }, { D28, GPIOJ, 15 }, { D29, GPIOJ,  2 },
+    { D30, GPIOK,  3 }, { D31, GPIOJ,  3 }, { D32, GPIOK,  4 }, { D33, GPIOJ,  4 },
+    { D34, GPIOK,  5 }, { D35, GPIOJ,  5 }, { D36, GPIOK,  6 }, { D37, GPIOJ,  6 },
+    // ---- module 1 : GIGA D38..D53 ---------------------------------------
+    { D38, GPIOJ,  7 }, { D39, GPIOI, 14 }, { D40, GPIOE,  6 }, { D41, GPIOK,  7 },
+    { D42, GPIOI, 15 }, { D43, GPIOI, 10 }, { D44, GPIOG, 10 }, { D45, GPIOI, 13 },
+    { D46, GPIOH, 15 }, { D47, GPIOB,  2 }, { D48, GPIOK,  0 }, { D49, GPIOE,  4 },
+    { D50, GPIOI, 11 }, { D51, GPIOE,  5 }, { D52, GPIOK,  2 }, { D53, GPIOG,  7 },
+};
 
 // Control pins as (port, bit) for fast register access.
-#define AD7606_CONVST_PORT    GPIOJ
-#define AD7606_CONVST_BIT     12
-#define AD7606_RESET_PORT     GPIOG
-#define AD7606_RESET_BIT      13
-#define AD7606_RD_PORT        GPIOG
-#define AD7606_RD_BIT         12
-#define AD7606_CS0_PORT       GPIOJ
-#define AD7606_CS0_BIT        14
-#define AD7606_CS1_PORT       GPIOJ
-#define AD7606_CS1_BIT        15
-#define AD7606_BUSY0_PORT     GPIOI
-#define AD7606_BUSY0_BIT      14
-#define AD7606_BUSY1_PORT     GPIOI
-#define AD7606_BUSY1_BIT      15
+#define AD7606_CONVST_PORT    GPIOC
+#define AD7606_CONVST_BIT     4
+#define AD7606_RESET_PORT     GPIOC
+#define AD7606_RESET_BIT      5
+#define AD7606_RD_PORT        GPIOB
+#define AD7606_RD_BIT         0
+#define AD7606_CS_PORT        GPIOB
+#define AD7606_CS_BIT         1
+#define AD7606_BUSY0_PORT     GPIOC
+#define AD7606_BUSY0_BIT      3
+#define AD7606_BUSY1_PORT     GPIOC
+#define AD7606_BUSY1_BIT      2
 
 // AD7606 RESET is active-HIGH (holds the part in reset). Set to 0 if your module
 // uses an active-low /RESET.
@@ -110,19 +153,15 @@
 #define AD7606_TRD_NS              30    // RD high time between reads
 #define AD7606_BUSY_TIMEOUT_US     50    // give up waiting for BUSY (safety)
 
-// Arduino digital pins (used only for pinMode()/setup; the hot path uses the
-// port/bit definitions above).
-static const uint8_t AD7606_DATA_PINS[AD7606_NUM_CHANNELS] = {
-    D25, D27, D29, D31, D33, D35, D37, D38,   // DB0..DB7   -> PJ0..PJ7
-    D48, D10, D52, D30, D32, D34, D36, D41,   // DB8..DB15  -> PK0..PK7
-};
-static const uint8_t AD7606_CONVST_PIN = D22;
-static const uint8_t AD7606_RESET_PIN  = D23;
-static const uint8_t AD7606_RD_PIN     = D24;
-static const uint8_t AD7606_CS0_PIN    = D26;
-static const uint8_t AD7606_CS1_PIN    = D28;
-static const uint8_t AD7606_BUSY0_PIN  = D39;
-static const uint8_t AD7606_BUSY1_PIN  = D42;
+// Control pins as Arduino numbers (used only for pinMode() in begin(); the hot
+// path uses the (port, bit) definitions above, and every data line carries its
+// own Arduino number inside AD7606_DB_LINES).
+static const uint8_t AD7606_CONVST_PIN = A0;
+static const uint8_t AD7606_RESET_PIN  = A1;
+static const uint8_t AD7606_RD_PIN     = A2;
+static const uint8_t AD7606_CS_PIN     = A3;
+static const uint8_t AD7606_BUSY0_PIN  = A4;
+static const uint8_t AD7606_BUSY1_PIN  = A5;
 
 // ===========================================================================
 // Event detector defaults  (tune these to your signal / detector bandwidth)
@@ -162,6 +201,10 @@ static const uint8_t AD7606_BUSY1_PIN  = D42;
 //   DAC            : 4096 codes over ~3.3 V (VREF+)         = 1241 codes/V
 //   AD7606 +/-10 V : 32768 counts / 10 V = 3276.8 counts/V  -> 2.64 counts/count
 //   AD7606 +/-5 V  : 32768 counts /  5 V = 6553.6 counts/V  -> 5.28 counts/count
+// A unipolar sensor (0..3.3 V / 0..5 V) also uses the +/-5 V setting: the code
+// simply stays in the positive half (0..+32767 for 0..5 V).  The ABSOLUTE
+// detector bounds (DET_MIN_MAX_VALUE, DET_MIN_AREA, DET_MAX_SLOPE) scale by the
+// same factor when the range changes; the sigma-relative ones do not.
 #define SIGNALGEN_ADC_PER_DAC    2.64f
 
 // Busy-wait helper used for sub-microsecond AD7606 timing margins.

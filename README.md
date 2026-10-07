@@ -1,7 +1,8 @@
 # sorter-firmware
 
 Arduino **GIGA R1 WiFi** (STM32H747, dual-core) firmware that reads two **AD7606**
-modules over their **parallel bus** (no SPI/serial protocol), combines the
+modules over their **parallel buses** (one 16-bit bus per module, shared control
+lines; no SPI/serial protocol), combines the
 enabled ADC channels into one signal (all 16 in the real application; see
 `SORTER_ACTIVE_CHANNEL_MASK`), detects peak events on an adaptive baseline +
 standard deviation threshold, and reports per-event metrics (max value, area,
@@ -18,7 +19,7 @@ with `RPC.cpu_id()` (`CM4_CPUID` / `CM7_CPUID`):
 
 | Core | Responsibility |
 |------|----------------|
-| **M4** | Drive the AD7606 bus, read + combine 16 channels, run the event detector, push each closed event to the M7 |
+| **M4** | Drive the two AD7606 buses (shared control lines), read + combine 16 channels, run the event detector, push each closed event to the M7 |
 | **M7** | Receive event frames over the RPC raw endpoint and hand them to the application (currently printed to Serial) |
 
 Inter-core transport uses the built-in `RPC` library (OpenAMP/rpmsg). Metrics
@@ -39,34 +40,96 @@ the RPC function dispatcher cannot carry this many fields as call arguments.
 | `test/model_check.py` | Python mirror of the detector + synthetic validation |
 | `test/test_event_detector.cpp` | C++ unit test for the detector (host) |
 | `test/run_tests.ps1` | Builds & runs the C++ unit test |
+| `test/verify_adc_pinmap.ps1` | Checks the AD7606 pin map (config.h vs README vs GIGA core) |
 
 ## Wiring (suggested pin map)
 
-Two AD7606 modules share **one** 16-bit data bus. Each module drives the bus only
-while its own `CS` is asserted, so they can share the data lines. A single
-`CONVST` starts both modules simultaneously so all 16 detectors sample the same
-instant.
+The two AD7606 modules use **separate 16-bit data buses** and **shared control
+lines**: `CONVST`, `RESET`, `RD` and `CS` are tied together, so both modules
+convert, reset and shift out their data on exactly the same edges. Each module
+keeps its **own** `DB0..DB15` (2 × 16 = **32 data lines**), which is exactly what
+makes the shared strobes safe: two independent buses can never contend, so no
+per-module `CS` sequencing and no three-state timing is involved.
 
-**Data bus DB0–DB15 (MCU inputs)** — packed so the whole word is latched with two
-register reads (`GPIOJ` low byte, `GPIOK` high byte):
+Because one `CONVST` starts both conversions and one `RD` strobe advances both
+modules, channel *n* of module 0 and channel *n* of module 1 are latched in the
+**same `RD` cycle** — the 16 channels are one snapshot of the same instant.
 
-| ADC line | GIGA pin | STM32 |
-|---|---|---|
-| DB0..DB7 | D25 D27 D29 D31 D33 D35 D37 D38 | PJ0..PJ7 |
-| DB8..DB15 | D48 D10 D52 D30 D32 D34 D36 D41 | PK0..PK7 |
+**Data buses (MCU inputs, 2 × DB0..DB15)**
 
-**Control lines**
+| Module | ADC lines | GIGA pins | STM32 |
+|---|---|---|---|
+| 0 | DB0..DB7  | D22 D23 D24 D25 D26 D27 D28 D29 | PJ12 PG13 PG12 PJ0 PJ14 PJ1 PJ15 PJ2 |
+| 0 | DB8..DB15 | D30 D31 D32 D33 D34 D35 D36 D37 | PK3 PJ3 PK4 PJ4 PK5 PJ5 PK6 PJ6 |
+| 1 | DB0..DB7  | D38 D39 D40 D41 D42 D43 D44 D45 | PJ7 PI14 PE6 PK7 PI15 PI10 PG10 PI13 |
+| 1 | DB8..DB15 | D46 D47 D48 D49 D50 D51 D52 D53 | PH15 PB2 PK0 PE4 PI11 PE5 PK2 PG7 |
+
+The 32 lines are the GIGA digital block `D22..D53` in order: module 0 takes
+`D22..D37` and module 1 takes `D38..D53`, so each module can use a single 16-way
+header / ribbon cable.
+
+**Control lines** — one GIGA pin each, wired to the *same* signal on both modules:
 
 | Signal | GIGA pin | STM32 | Notes |
 |---|---|---|---|
-| CONVST (A+B tied) | D22 | PJ12 | shared, starts both modules |
-| RESET | D23 | PG13 | shared |
-| RD | D24 | PG12 | shared; module chosen via CS |
-| CS module 0 | D26 | PJ14 | |
-| CS module 1 | D28 | PJ15 | |
-| BUSY module 0 | D39 | PI14 | input |
-| BUSY module 1 | D42 | PI15 | input |
+| CONVST (A+B tied on each module) | A0 | PC4 | shared, starts both conversions |
+| RESET | A1 | PC5 | shared |
+| RD | A2 | PB0 | shared; one strobe advances both modules |
+| CS | A3 | PB1 | shared; asserted for the whole 8-strobe burst |
+| BUSY module 0 | A4 | PC3 | input |
+| BUSY module 1 | A5 | PC2 | input — **never tie to BUSY0** |
 | OS0/1/2 | — | — | tie LOW (no oversampling = max rate) |
+
+> **Changing the map.** `AD7606_DB_LINES[]` in `config.h` is the single place that
+> defines all 32 data lines — one `{Arduino pin, port, bit}` entry per line — plus
+> the six `AD7606_*_PIN` control pins (`CONVST`, `RESET`, `RD`, `CS`, `BUSY0`,
+> `BUSY1`, on `A0..A5`). The read path does not require the data
+> lines to be contiguous, so **any** free GIGA pin works; just keep the
+> `{port, bit}` entry in sync with the Arduino pin number.
+
+### The analog inputs are *not* part of these tables
+
+The modules' **analog** inputs stay in the analog domain: they are never wired to
+the GIGA. Each AD7606 is an 8-channel part, so the pair carries **16 analog
+channels** in total (`V1..V8` on module 0 and `V1..V8` on module 1), each with its
+AGND return:
+
+| Side | Lines | Connects to |
+|---|---|---|
+| Analog | 16 × `Vx` (+ AGND returns) | the detectors / signal sources |
+| Digital | 2 × 16 `DB0..DB15` + 4 shared control + 2 `BUSY` | the GIGA (**38 pins**) |
+
+So count the GIGA side, not the ADC side: **38 MCU pins** — 32 data lines plus
+`CONVST`, `RESET`, `RD`, `CS`, `BUSY0`, `BUSY1`. The 32 data lines carry **16
+channels at 16 bits**: 8 channels per module (`V1..V8`), each with its own 16-bit
+word, and all of them latched in the same `RD` cycles. `Adc7606Parallel::readAll()`
+therefore opens one shared `CS` burst, clocks 8 `RD` pulses and fills both halves
+of `channels[]` per pulse (channels `0..7` = module 0, `8..15` = module 1).
+
+Consequences for a real build:
+
+* Never tie the two `BUSY` lines together — they are push-pull outputs on the
+  module side, so tying them shorts two drivers. Keep `BUSY0`/`BUSY1` separate;
+  `readAll()` waits for both.
+* Tie **CONVST A and CONVST B** together on each module, otherwise only `V1..V4`
+  convert.
+* `CS0`/`CS1` on the modules may be tied together and driven by A3 (as in the
+  table). Tying them permanently low also works: a new conversion re-arms the
+  read pointer at `V1`, so the firmware's `CS` pulse is then simply unused.
+* Every module needs its **own** 16 data lines. Carrier boards with (always
+  enabled) bus buffers are fine here — nothing is three-stated on the module side,
+  unlike on a single shared 16-line bus.
+* `CS` is assumed **active-low** (assert = drive low). If your modules invert it
+  (e.g. via a `74HC138`), invert the logic in `Adc7606Parallel::readAll()`.
+* The **control lines use `A0..A5`** (D76..D81): six plain GPIOs on the analog
+  header, which keeps the digital block `D22..D53` free for the 32 data lines and
+  makes `CONVST`/`RESET`/`RD`/`CS`/`BUSY0`/`BUSY1` quick to wire. `A6`/`A7` are
+  left free (the GIGA's own ADC is unused because all 16 analog channels come
+  from the AD7606s) and `A12`/`A13` stay reserved for the bench-test DACs.
+* None of the 38 used pins (`D22..D53` + `A0..A5`) has an on-board peripheral
+  default on the GIGA (LEDs, USB, QSPI flash, SDRAM and the radio module are all
+  on other pins), and `A0..A7` are ADC1 inputs that also work as digital I/O, so
+  the whole map can be driven/read as plain GPIO without fighting the mbed core.
 
 ### Hardware notes (important)
 
@@ -75,8 +138,97 @@ register reads (`GPIOJ` low byte, `GPIOK` high byte):
   3.3 V drivers.
 * Tie `OS0..OS2` low for no oversampling (maximum sample rate). Set them
   (3 GPIOs) if you later want hardware oversampling.
+* Check for a **`PAR/SER`** (or `BYTE SEL`) pin: it must be tied **LOW** for the
+  parallel bus this driver uses. Most breakouts already strap it on-board;
+  serial-only boards will not work with `adc7606_parallel.cpp`.
 * `RESET` polarity is configurable: `AD7606_RESET_ACTIVE_HIGH` in `config.h`
   (default `1`). Verify against your module if a reset does not take effect.
+* **Throughput:** `readWord()` collects its 16 bits with 16 individual register
+  bit reads (~0.7 µs per word on the M4), i.e. ~1.4 µs per `RD` strobe for both
+  modules and ~11 µs for the whole 8-strobe burst — far below the 100 µs period
+  of 10 kSPS. If you ever need >50 kSPS, move the 32 lines onto four contiguous
+  8-bit port fields (one `GPIOx->IDR` byte load per field) and
+  read one byte per field per strobe.
+
+* **Port fields in this map:** module 0 spans several ports (`GPIOJ`, `GPIOG`,
+  `GPIOK`), so a word is still 16 bit-reads. The only complete 8-bit field is
+  `PJ0..PJ7` (D25, D27, D29, D31, D33, D35, D37 = module 0 DB3..DB15 odd bits,
+  plus D38 = module 1 DB0). To go faster, remap each module's `DB0..DB15` onto
+  two 8-bit port fields and load `GPIOx->IDR` once per field per `RD` strobe.
+
+### Module silkscreen → AD7606 pin
+
+Cheap "AD7606 8-channel" breakouts abbreviate the mode/config pins. None of these
+lines is wired to the GIGA in this project — they are **static straps**, so a
+different labelling does not change `config.h`:
+
+| Module label | AD7606 pin | Type | What it does | Strap for this project |
+|---|---|---|---|---|
+| `RAGE` (RANGE, silkscreen clipped) | `RANGE` | input | selects the analog range of **all 8 channels at once**: low = ±5 V, high = ±10 V | tie to GND for ±5 V (preferred: doubles the counts/V) or to 3.3 V for ±10 V — **both modules must match**, then set `SIGNALGEN_ADC_PER_DAC` (5.28 / 2.64) |
+| `CVA` | `CONVST A` | input, rising edge | starts the conversion of `V1..V4` | tie `CVA` and `CVB` together on each module and drive the pair from the shared `CONVST` line |
+| `CVB` | `CONVST B` | input, rising edge | starts the conversion of `V5..V8` | same node as `CVA`; left floating, only half of each module's channels convert |
+| `FRST` | `FRSTDATA` | **output** | goes high when the first result (`V1`) is on `DB0..DB15` and low again after the first `RD` | unused — leave open or scope it. Never drive it, and never tie the two modules' `FRST` pins together (two push-pull drivers) |
+| `VO` | `VDRIVE` (many boards print `VIO`) | power input | digital-interface supply (2.3 … 5.25 V): sets the logic thresholds `V_IH`/`V_OL` of the parallel bus | tie to **3.3 V**, not 5 V — at VDRIVE = 5 V the required `V_IH` is ≈ 3.5 V and the GIGA's 3.3 V drivers are no longer guaranteed high |
+
+> If the `VO` label is ambiguous on your board, measure it before wiring: with the
+> module powered and nothing attached, an **input** pin sits near 0 V while a
+> regulator **output** reads ≈ 3.3 V or 5 V (do not back-feed an output — feed
+> `VDRIVE` from the GIGA's 3.3 V instead). `FRST` needs no measurement: it is an
+> output on every AD7606 (check the datasheet for your exact part number).
+
+### Analog ranges: 0–3.3 V / 0–5 V (single-supply) sensors
+
+The AD7606 has **no unipolar range**: `RANGE` selects ±5 V (low) or ±10 V (high),
+and the output is two's complement with **0 V = code 0**. A sensor that only goes
+0 … +5 V therefore can never fill more than the *positive half* of the codes
+(15 bits), whatever you do with the strap — that is a property of the part, not of
+the wiring. In other words the penalty for using a bipolar converter on a
+unipolar signal is exactly **one bit** on the ±5 V range (32768 codes for 0 … 5 V,
+152.6 µV/LSB, versus 76.3 µV/LSB for a hypothetical 0 … 5 V unipolar part) and
+**two bits** on ±10 V (16384 codes, 305 µV/LSB) — which is why the ±5 V strap is
+the right choice for 0 … 5 V sensors.
+
+| Sensor span | `RANGE` strap | Codes produced | counts/V | LSB |
+|---|---|---|---|---|
+| 0 … 5 V | **GND** (±5 V) | 0 … +32767 | 6553.6 | 152.6 µV |
+| 0 … 3.3 V | **GND** (±5 V) | 0 … +21627 | 6553.6 | 152.6 µV |
+| 0 … 10 V | 3.3 V (±10 V) | 0 … +32767 | 3276.8 | 305 µV |
+
+Rule of thumb: pick the bipolar range whose magnitude matches the sensor's
+maximum (0–5 V → ±5 V, 0–10 V → ±10 V). The unused sign bit costs nothing real:
+the part's own noise floor on the ±5 V range is already several LSB rms.
+
+Wiring a single-supply sensor:
+
+* **Tie the sensor ground to the module's `AGND`** (and the GIGA's GND). A
+  single-supply sensor's "0 V" is only 0 V relative to that node — a floating
+  ground is the number one cause of a bogus offset on unipolar signals.
+* Keep the source impedance low (≲ a few kΩ) and add a series resistor (~1 kΩ)
+  plus a small cap (1–10 nF) to AGND per used channel: the 8 inputs are sampled
+  simultaneously and then multiplexed, so the sample capacitors need a
+  low-impedance source to settle within the 100 µs sample period.
+* The analog inputs are 1 MΩ and internally protected to ±16.5 V, so a 5 V sensor
+  cannot damage the ADC even if it overshoots (the code simply clips at +32767).
+  The 3.3 V ceiling applies to the **digital** side (`VDRIVE`), not to the analog
+  input, so 0–5 V sensors need no level shifting here.
+* Unused `Vx` inputs: tie them to AGND so they read ~0 counts.
+
+Software: nothing range-specific is baked into the driver (`readAll()` returns
+signed counts and the detector only looks at deviations from its adaptive
+baseline), but the **absolute** count bounds scale ×2 when moving from ±10 V to
+±5 V at the same signal voltage — `DET_MIN_MAX_VALUE`, `DET_MIN_AREA`,
+`DET_MAX_SLOPE` and the bench `SIGNALGEN_ADC_PER_DAC` (2.64 → 5.28). The
+σ-relative ones (`DET_K_ON`/`DET_K_OFF`/`DET_K_GATE`, `DET_SIGMA_FLOOR`) are
+scale-free and need no change.
+
+If you truly need a 0–5 V signal to occupy the whole 16-bit span: a single-supply
+gain stage (0–3.3 V × ~1.52 → 0–5 V, rail-to-rail op-amp on the existing 5 V
+rail) fills the positive half and gives the best resolution for a 3.3 V sensor
+(≈100 µV/LSB) without a negative supply. Using all 65536 codes would require the
+input to swing to −5 V, hence an op-amp with a negative rail — not worth it for a
+theoretical 1 LSB. A genuinely unipolar ADC is different silicon (e.g. the
+software-configurable AD7606B/AD7606C variants, or TI's ADS8688 family, which is
+not compatible with this driver).
 
 ## Detector algorithm (`event_detector.h`)
 
@@ -140,6 +292,14 @@ without the board:
   ```powershell
   pwsh test\run_tests.ps1
   ```
+
+* **Pin-map check (needs the `arduino:mbed_giga` core installed)**
+  ```powershell
+  pwsh test\verify_adc_pinmap.ps1
+  ```
+  Compares the 32 data lines and the 6 control pins in `config.h` with the GIGA
+  `variant.cpp`, checks that `README.md` lists the same pins in the same order,
+  and fails if a pin is used twice or carries an on-board peripheral function.
 
 Both check the same scenario: the three broad peaks must be reported as VALID
 (max ~= 800, width ~= 1100 samples) and the two glitches rejected.
@@ -241,7 +401,8 @@ free-runs again, and all 16 channels are combined
   `SORTER_ACTIVE_CHANNEL_MASK` (`SORTER_COMBINE_MEAN`).
 * The loop is paced to `SORTER_SAMPLE_RATE_HZ` (10 kSPS by default) so the
   detector runs at the rate its bounds were written for. Set it to `0` to
-  free-run: with no oversampling the AD7606 needs ~3.5 us per conversion plus 16
-  short bus reads, so the loop can reach on the order of 100 ksamples/s.
+  free-run: with no oversampling the AD7606 needs ~3.5 us per conversion plus
+  ~11 us of bit-banged bus reads, so the loop free-runs at on the order of
+  50 ksamples/s — 10 kSPS leaves a wide margin.
 * Hardware-in-the-loop check of the whole chain: see
   "Bench test: DAC → AD7606 loopback" above.

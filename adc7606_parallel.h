@@ -1,11 +1,13 @@
 // adc7606_parallel.h
 //
-// Cortex-M4 driver for two AD7606 modules on a shared 16-bit parallel bus.
+// Cortex-M4 driver for two AD7606 modules wired as TWO 16-bit parallel buses
+// with shared control lines (CONVST/RESET/RD/CS tied together, see config.h).
 //
-// The bus is read with direct register accesses (see readBus()) so the whole
-// 16-bit word is latched with two loads from GPIOJ/GPIOK, keeping the per-sample
-// overhead low. Only the control lines are asserted/released with the port
-// bit-set/reset register (BSRR), which is also a single store.
+// readWord() latches one module's DB0..DB15 straight from the GPIO input
+// registers through AD7606_DB_LINES[], so the 32 data lines may sit on any free
+// GIGA pins - they do not have to be contiguous and no three-state timing is
+// involved. Only the control lines are asserted/released with the port
+// bit-set/reset register (BSRR), which is a single store.
 
 #pragma once
 
@@ -22,11 +24,13 @@ public:
     // modules start from a known state. Call once after begin().
     void reset();
 
-    // Start a simultaneous conversion on both modules (shared CONVST) and read
-    // all 16 channels:
-    //   channels[0..7]  -> module 0 (CS0)
-    //   channels[8..15] -> module 1 (CS1)
-    // Values are signed 16-bit two's-complement, as produced by the AD7606.
+    // Start a simultaneous conversion on both modules (shared CONVST), then read
+    // all 16 channels during one shared CS burst:
+    //   channels[0..7]  -> module 0 (on its own DB0..DB15)
+    //   channels[8..15] -> module 1 (on its own DB0..DB15)
+    // Channel n of both modules is latched in the SAME RD cycle, so the 16
+    // values are one snapshot of the same instant. Values are signed 16-bit
+    // two's-complement, as produced by the AD7606.
     void readAll(int32_t channels[AD7606_NUM_CHANNELS]);
 
     // Convenience: convert + read + combine into a single sample the channels
@@ -35,8 +39,6 @@ public:
     int32_t readCombined();
 
 private:
-    static inline uint16_t readBus();
     void convstPulse();
     void waitReady();
-    void readModule(uint8_t moduleIndex, int32_t* out, uint8_t base);
 };

@@ -6,7 +6,8 @@
 // runtime with RPC.cpu_id().  Upload with the GIGA board selected.
 //
 //   Cortex-M4 (240 MHz) -- full acquisition + signal-processing pipeline:
-//     * reads two AD7606 modules over a shared 16-bit parallel bus,
+//     * reads two AD7606 modules, each on its own 16-bit parallel bus, with
+//       shared control lines (one instant for all 16 channels),
 //     * combines the enabled channels into one sample per conversion
 //       (SORTER_ACTIVE_CHANNEL_MASK; all 16 in the real application),
 //     * detects peak events on an adaptive baseline + std-dev threshold,
