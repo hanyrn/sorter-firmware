@@ -56,6 +56,7 @@ does the **M7 pass first, then the M4 pass**, and why `-Split` exists.
 | `monitor.ps1` | Opens a serial terminal on the board via `arduino-cli monitor` |
 | `test/model_check.py` | Python mirror of the detector + synthetic validation |
 | `test/model_check_aggregator.py` | Python mirror of the aggregator (LINKED / PER_CHANNEL) |
+| `test/plot_signals.py` | Plots the AD7606 input waveform + detector verdicts (SVG/HTML, no deps) |
 | `test/test_event_detector.cpp` | C++ unit test for the detector (host) |
 | `test/test_event_aggregator.cpp` | C++ unit test for the aggregator (host) |
 | `test/run_tests.ps1` | Builds & runs the C++ unit tests |
@@ -428,6 +429,19 @@ validated without the board:
   C++ aggregator and checks both modes: in LINKED every channel inherits the
   primary's window, in PER_CHANNEL each channel keeps its own width. Both print
   `PASS`.
+
+* **Signal plot (no hardware, no third-party packages)**
+  ```powershell
+  py -3 test\plot_signals.py                        # DAC loopback -> test\signals.html
+  py -3 test\plot_signals.py --source model --range 5
+  ```
+  `plot_signals.py` graphs the voltage the AD7606 will digitize - in the bench
+  loopback that is the DAC output itself - and shades the detector's own verdicts
+  (VALID / rejected + reason) using the same `model_check.py` mirror. It writes a
+  self-contained HTML/SVG (no Python packages required) plus a text summary, and
+  opens the file in your default browser when it finishes (`--no-open` to skip).
+  The default `--source dac` mirrors `signal_gen.cpp`'s `kPattern`; `--source model`
+  plots `model_check.py`'s signal.
 
 * **C++ unit tests (need g++/clang++)**
   ```powershell

@@ -7,3 +7,6 @@ build/
 
 # Host-side C++ unit test binaries (built by test/run_tests.ps1)
 test/*.exe
+
+# Generated signal plots (test/plot_signals.py)
+test/signals*.html
