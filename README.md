@@ -26,6 +26,17 @@ Inter-core transport uses the built-in `RPC` library (OpenAMP/rpmsg). Metrics
 travel as one fixed-size `sorter::PeakFrame` over the **raw** endpoint, because
 the RPC function dispatcher cannot carry this many fields as call arguments.
 
+### Flash split
+
+Both cores are flashed through the bootloader with `dfu-util`, and the *flash
+split* is what makes the two images agree on the layout. `flash.ps1` passes
+`-Split 75_25` (1.5 MB M7 + 0.5 MB M4) to both passes, which sets
+`CM4_BINARY_START=0x08180000` for the M7 code and `upload.address_m4=0x08180000`
+for the M4 upload — the M4 image is placed exactly where the M7 boot code looks
+for it when `RPC.begin()` starts the co-processor. Without an explicit split the
+address is empty and the M4 upload is rejected, which is why `flash.ps1` always
+does the **M7 pass first, then the M4 pass**, and why `-Split` exists.
+
 ## Source layout
 
 | File | Purpose |
@@ -38,6 +49,7 @@ the RPC function dispatcher cannot carry this many fields as call arguments.
 | `metrics_sink.h` | M4→M7 metric frame encode/parse over the RPC raw endpoint |
 | `signal_gen.{h,cpp}` | Bench-test synthetic signal generator (drives the two DACs) |
 | `flash.ps1` | Builds + uploads both GIGA cores (M7 first, then M4) over `arduino-cli` |
+| `monitor.ps1` | Opens a serial terminal on the board via `arduino-cli monitor` |
 | `test/model_check.py` | Python mirror of the detector + synthetic validation |
 | `test/test_event_detector.cpp` | C++ unit test for the detector (host) |
 | `test/run_tests.ps1` | Builds & runs the C++ unit test |
@@ -265,25 +277,39 @@ Using the Arduino CLI (the GIGA core is `arduino:mbed_giga`):
 arduino-cli core install arduino:mbed_giga
 
 # 1) main (M7) core
-arduino-cli compile --fqbn arduino:mbed_giga:giga .
-arduino-cli upload  --fqbn arduino:mbed_giga:giga -p <PORT> .
+arduino-cli compile --fqbn "arduino:mbed_giga:giga:split=75_25" .
+arduino-cli upload  --fqbn "arduino:mbed_giga:giga:split=75_25" -p <PORT> .
 
 # 2) M4 co-processor
-arduino-cli compile --fqbn "arduino:mbed_giga:giga:target_core=cm4" .
-arduino-cli upload  --fqbn "arduino:mbed_giga:giga:target_core=cm4" -p <PORT> .
+arduino-cli compile --fqbn "arduino:mbed_giga:giga:target_core=cm4,split=75_25" .
+arduino-cli upload  --fqbn "arduino:mbed_giga:giga:target_core=cm4,split=75_25" -p <PORT> .
 ```
 
 In VS Code this folder is an Arduino sketch (see `.vscode/arduino.json`); set the
 board to **Arduino GIGA R1 WiFi** and build/upload once with *Target core* =
-**Main Core**, then again with *Target core* = **M4 Co-processor**.
+**Main Core**, then again with *Target core* = **M4 Co-processor**. Set *Flash
+split* to **1.5MB M7 + 0.5MB M4** for both (or just run `flash.ps1`, which passes
+`-Split 75_25`) — without a split the M4 upload has no address.
 
 ### First-time setup (fresh board)
 
-On Windows the GIGA needs **no driver**: plug the USB-C cable into the
-**programming port** (the one next to the DC jack) and the board enumerates as
-`USB Serial Device (COMx)`, which `arduino-cli` identifies as `Arduino Giga R1`
-(`arduino:mbed_giga:giga`). The second USB-C port is the *native* port used by
-`USBHost`/`USBDevice` sketches and does **not** appear as a COM port.
+Plug the USB-C cable into the **programming port** (the one next to the DC
+jack): the board enumerates as `USB Serial Device (COMx)` and `arduino-cli`
+identifies it as `Arduino Giga R1` (`arduino:mbed_giga:giga`). The second USB-C
+port is the *native* port used by `USBHost`/`USBDevice` sketches and does **not**
+appear as a COM port.
+
+Flashing on Windows additionally needs the Arduino **WinUSB driver** for the
+bootloader DFU interface (`USB\VID_2341&PID_0366&MI_00`), because `dfu-util`
+reaches that interface through libusb. The Arduino IDE installs it automatically;
+with `arduino-cli` alone it has to be installed once, as administrator:
+
+```powershell
+$core = "$env:LOCALAPPDATA\Arduino15\packages\arduino\hardware\mbed_giga\4.6.0"
+Start-Process "$core\post_install.bat" -Verb RunAs    # dpinst + drivers\giga.inf
+```
+
+Without it the upload fails with `No DFU capable USB device available`.
 
 1. **Core** (once per machine):
    ```powershell
@@ -295,19 +321,44 @@ On Windows the GIGA needs **no driver**: plug the USB-C cable into the
    ```
 3. **Flash both cores** with the helper script — it locates `arduino-cli` on
    `PATH`, or the copy bundled with the *Arduino Maker Workshop* VS Code
-   extension when the CLI is not on `PATH`:
+   extension when the CLI is not on `PATH`. Both passes state the **flash split**
+   explicitly (`-Split`, default `75_25` = 1.5 MB M7 + 0.5 MB M4): `arduino-cli`
+   does not apply the `boards.txt` menu defaults, and without a split the M4
+   upload address stays empty, so `dfu-util` rejects the file with
+   *"Only DfuSe file version 1.1a is supported"*:
    ```powershell
-   .\flash.ps1                 # M7 then M4, port auto-detected
+   .\flash.ps1                 # M7 then M4, port auto-detected, split 75_25
    .\flash.ps1 -SkipUpload     # compile check only, no board needed
    .\flash.ps1 -Monitor        # ... and open the 115200 serial monitor
    .\flash.ps1 -Port COM7      # if auto-detection picks the wrong port
+   .\flash.ps1 -Split 50_50    # 1 MB M7 + 1 MB M4 instead
    ```
 4. **Verify** at **115200 baud**: the `BENCH MODE` banner at boot, then metric
    lines whose `base=` reads ~5407 (±10 V) or ~10813 (±5 V) once the
    DAC → AD7606 loopback in the next section is wired.
 
+   Open a serial terminal with the helper script (`Ctrl+C` quits; only one
+   program can hold the port, so close any other monitor first):
+   ```powershell
+   .\monitor.ps1                 # auto-detects the board, 115200 baud
+   .\monitor.ps1 -Baud 9600 -Port COM7
+   .\flash.ps1 -Monitor          # flash, then watch the banner
+   ```
+
+   In VS Code that is just the integrated terminal (`Ctrl` + backtick). For a GUI
+   monitor, install Microsoft's *Serial Monitor* extension
+   (`code --install-extension ms-vscode.vscode-serial-monitor`): it adds a
+   **Serial Monitor** view to the Panel (`Ctrl+J`, also reachable via
+   *Terminal → New Terminal*), where you select `COM6` and the baud rate.
+
 Notes:
 
+* If an upload fails with `No DFU capable USB device available` — or the 1200-bps
+  touch is refused with `Access to the port 'COMx' is denied` — the board never
+  entered the bootloader because another program is holding the port: close the
+  VS Code *Serial Monitor* panel, any `.\monitor.ps1`, the Arduino IDE, PuTTY,
+  ... and retry. On a machine that has never flashed the board with the Arduino
+  IDE, install the DFU driver first (see *First-time setup*).
 * If an upload fails and the port disappears, the board is running a sketch rather
   than the bootloader: **double-tap RESET** and upload again, selecting the
   bootloader port that appears (usually a new `COMx`).
@@ -448,3 +499,38 @@ free-runs again, and all 16 channels are combined
   50 ksamples/s — 10 kSPS leaves a wide margin.
 * Hardware-in-the-loop check of the whole chain: see
   "Bench test: DAC → AD7606 loopback" above.
+
+## Troubleshooting
+
+### `undefined reference to pinMode` / `digitalWrite`
+
+The mbed core is compiled once and cached **per build configuration** in
+`%LOCALAPPDATA%\arduino\cores\arduino_mbed_giga_giga_split_75_25_<hash>\core.a`,
+and `arduino-cli` reuses that archive on every later build. If a build is
+**killed** (editor stopped, terminal closed, machine slept), the archive is left
+truncated and reused forever, so the link then fails with
+`undefined reference to pinMode` / `digitalWrite` — both live in
+`wiring_digital.cpp.o`, which is simply missing from the short archive. Delete
+both caches and rebuild:
+
+```powershell
+Remove-Item "$env:LOCALAPPDATA\arduino\cores"    -Recurse -Force
+Remove-Item "$env:LOCALAPPDATA\arduino\sketches" -Recurse -Force
+```
+
+A healthy archive for `split=75_25` is ≈52 MB (29 members); a truncated one is
+much smaller and misses members. Deleting only `...\sketches` is *not* enough.
+
+### `No DFU capable USB device available` (uploading error: exit status 74)
+
+Two different causes:
+
+* **The port moved between the two passes.** The board re-enumerates while it is
+  being flashed: the bootloader keeps the port that was touched and the app comes
+  back on a different one (seen here: `-Port COM7` for the M7, app back as
+  `COM6`). `flash.ps1` re-detects the port before each upload and warns
+  `port COM7 is gone ... - re-detecting`. Check the live port with
+  `arduino-cli board list`: a running app reports `Arduino Giga R1`
+  (`arduino:mbed_giga:giga`), a board stuck in the bootloader does not.
+* **The bootloader WinUSB driver is missing** — see *First-time setup (fresh
+  board)* above.
