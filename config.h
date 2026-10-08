@@ -88,6 +88,18 @@
 #endif
 
 // ===========================================================================
+// M7 serial output
+// ===========================================================================
+// The M7 prints one block per event bundle (printBundle() in the .ino).  When no
+// event has been printed for this long, it emits a short liveness heartbeat
+// instead, so the board can be seen to be alive -- and the M4 -> M7 link shown to
+// be up -- even when nothing is being detected (no sensors attached, or no
+// DAC -> AD7606 loopback wired in bench mode).  The heartbeat is suppressed
+// while events are flowing, so it never interleaves with an event's output.
+// Set to 0 to disable the heartbeat.
+#define SORTER_M7_HEARTBEAT_MS  2000u
+
+// ===========================================================================
 // AD7606 parallel buses -- Arduino GIGA R1 WiFi digital pins
 // ===========================================================================
 //

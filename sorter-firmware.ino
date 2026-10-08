@@ -249,16 +249,43 @@ void setup() {
         Serial.println("Expected per 2 s pattern cycle: 3 VALID events (one 'ch' line per");
         Serial.println("measured channel) + 3 rejected events.");
 #endif
+#if SORTER_M7_HEARTBEAT_MS
+        Serial.print("Heartbeat: a liveness line every ");
+        Serial.print(SORTER_M7_HEARTBEAT_MS);
+        Serial.println(" ms whenever no event has just been printed.");
+#endif
     }
 }
 
 void loop() {
     if (RPC.cpu_id() == CM7_CPUID) {
+        // Print every event the M4 sent, remembering the moment of the last
+        // printout so an idle heartbeat can fill the quiet gaps.
+        static uint32_t lastOutputMs = 0;
+        static uint32_t eventCount   = 0;
+
         EventRecord* r;
         while ((r = g_m7Mail.try_get()) != nullptr) {
             printBundle(*r);
             g_m7Mail.free(r);
+            lastOutputMs = millis();
+            eventCount++;
         }
+
+        // Liveness heartbeat: if nothing has been printed for a while, say so, so
+        // the board is visibly alive even with no events (no sensors / no DAC ->
+        // AD7606 loopback).  Suppressed while events flow, so it never interleaves
+        // with an event's block.  SORTER_M7_HEARTBEAT_MS = 0 disables it.
+#if SORTER_M7_HEARTBEAT_MS
+        if (millis() - lastOutputMs >= SORTER_M7_HEARTBEAT_MS) {
+            Serial.print("M7 heartbeat: ");
+            Serial.print(millis() / 1000u);
+            Serial.print(" s up, ");
+            Serial.print(eventCount);
+            Serial.println(" event(s) so far.");
+            lastOutputMs = millis();
+        }
+#endif
         delay(1);
     } else {
         delay(1000);   // M4: the work happens in the acquisition thread
