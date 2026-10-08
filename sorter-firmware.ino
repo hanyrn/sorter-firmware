@@ -23,6 +23,13 @@
 //   Cortex-M7 (480 MHz) -- placeholder consumer of the event metrics. For now it
 //     only prints them (one line per channel); the higher-level application logic
 //     is added later.
+//
+//   Live datastream (test/live_plot.py): besides the event log the M4 ships
+//     decimated raw samples (stream_sink.h) to the M7, which can print them as
+//     `S,<index>,<code>,<ch>:<value>...` lines.  That is the live plot window.
+//     Streaming is OFF at boot - switch it on with `T` + Enter in the serial
+//     monitor (or let live_plot.py send the command itself), so the human-readable
+//     event log stays readable.
 
 #include <RPC.h>
 using namespace rtos;
@@ -34,6 +41,7 @@ using namespace rtos;
 #include "adc7606_parallel.h"
 #include "metrics_sink.h"
 #include "signal_gen.h"
+#include "stream_sink.h"
 
 // ===========================================================================
 // M4: acquisition + detection pipeline
@@ -116,6 +124,15 @@ static void acquisitionTask() {
     uint32_t index          = 0;
     uint32_t next_sample_us = micros();
 
+    // Which AD7606 channels the sample stream carries: the first
+    // SORTER_STREAM_CHANNELS entries of SORTER_ACTIVE_CHANNEL_MASK, resolved once
+    // instead of per sample (0xFF = the mask does not have that many channels,
+    // see stream_sink.h).
+    uint8_t stream_channels[SORTER_STREAM_CHANNELS];
+    for (uint8_t k = 0; k < (uint8_t)SORTER_STREAM_CHANNELS; k++) {
+        stream_channels[k] = sorter::streamChannelIndex(k);
+    }
+
     for (;;) {
         waitNextSample(next_sample_us);
 
@@ -136,6 +153,26 @@ static void acquisitionTask() {
         // (inverted) value.
         applyInputPolarity(channels, SORTER_INVERT_CHANNEL_MASK);
 
+        // ---- sample stream for the live plot window -------------------------
+        // One point every SORTER_STREAM_DECIM-th sample, carrying the generated
+        // DAC code (the "expected" trace) plus the detector-input value of the
+        // first SORTER_STREAM_CHANNELS active channels (post polarity, i.e.
+        // exactly what the detectors see).  The M4 ships these frames
+        // unconditionally and the M7 decides whether to print them, so the
+        // readable event log is untouched until streaming is switched on.
+        if ((index % SORTER_STREAM_DECIM) == 0u) {
+            int32_t values[SORTER_STREAM_CHANNELS];
+            for (uint8_t k = 0; k < (uint8_t)SORTER_STREAM_CHANNELS; k++) {
+                const uint8_t ch = stream_channels[k];
+                values[k] = (ch < (uint8_t)AD7606_NUM_CHANNELS) ? channels[ch] : 0;
+            }
+#if SORTER_SIGNAL_GEN
+            sorter::streamSample(index, g_signalGen.code(), values);
+#else
+            sorter::streamSample(index, 0, values);   // no generator -> gen == 0
+#endif
+        }
+
         // Every channel is measured on its own; a completed event carries one
         // record per active channel and is handed to the M7 in a single frame.
         if (g_aggregator.update(channels, micros(), index, g_event)) {
@@ -146,11 +183,32 @@ static void acquisitionTask() {
 }
 
 // ===========================================================================
-// M7: receive event bundles from the M4
+// M7: receive event bundles and sample frames from the M4
 // ===========================================================================
-static Mail<EventRecord, 4> g_m7Mail;   // events are rare: 4 pending is plenty
+static Mail<EventRecord, 4> g_m7Mail;      // events are rare: 4 pending is plenty
+static Mail<sorter::StreamFrame, 4> g_streamMail;  // ~400 bytes each, ~16 frames/s
 
-static void onMetricsRaw(const uint8_t* buf, size_t len) {
+// Raw sink for everything the M4 sends: one endpoint, two frame kinds, told apart
+// by the magic word at the front of the frame.
+static void onM4RawFrame(const uint8_t* buf, size_t len) {
+    uint16_t magic = 0xFFFFu;
+    if (len >= sizeof(magic)) {
+        memcpy(&magic, buf, sizeof(magic));
+    }
+
+    if (magic == sorter::STREAM_FRAME_MAGIC) {
+        sorter::StreamFrame* slot = g_streamMail.try_alloc();
+        if (slot == nullptr) {
+            return;                        // M7 is behind: drop this frame
+        }
+        if (!sorter::parseStreamFrame(buf, len, *slot)) {
+            g_streamMail.free(slot);
+            return;
+        }
+        g_streamMail.put(slot);
+        return;
+    }
+
     EventRecord rec;
     if (!sorter::parseBundle(buf, len, rec)) {
         return;
@@ -225,6 +283,102 @@ static void printBundle(const EventRecord& rec) {
 }
 
 // ===========================================================================
+// M7: sample stream -> USB serial (the live plot window)
+// ===========================================================================
+// The M4 sends the frames all the time; the M7 stays quiet until the host asks for
+// them, so the readable event log is unaffected when nobody is plotting.
+//
+//   T      toggle the stream          T1 / T0   on / off
+//   ?      list the commands
+static bool     g_streamOn    = false;
+static uint32_t g_streamLines = 0;      // points printed since streaming came on
+
+// Metadata line: the host learns the decimation (=> the sample rate) and which
+// channels the columns carry from here instead of hard-coding config.h.
+static void printStreamInfo() {
+    Serial.print("STREAM ");
+    Serial.print(g_streamOn ? "on" : "off");
+    Serial.print(": decim=");
+    Serial.print((unsigned)SORTER_STREAM_DECIM);
+    Serial.print(" chans=");
+    uint8_t printed = 0;
+    for (uint8_t k = 0; k < (uint8_t)SORTER_STREAM_CHANNELS; k++) {
+        const uint8_t ch = sorter::streamChannelIndex(k);
+        if (ch == 0xFFu) { continue; }
+        if (printed++ > 0u) { Serial.print(','); }
+        Serial.print(ch);
+    }
+    Serial.print(" wf=");           // 1 = the gen column is a real generated code
+#if SORTER_SIGNAL_GEN
+    Serial.print('1');
+#else
+    Serial.print('0');
+#endif
+    Serial.print(" points=");
+    Serial.print((unsigned)SORTER_STREAM_POINTS);
+    Serial.println();
+    g_streamLines = 0;
+}
+
+// One line per point:   S,<sample index>,<gen code>,<ch>:<value>[,...]
+// Deliberately terse - at the default decimation this is 1000 lines/s.
+static void printStreamFrame(const sorter::StreamFrame& f) {
+    for (uint16_t i = 0; i < f.header.count; i++) {
+        const sorter::StreamPoint& p = f.point[i];
+        Serial.print('S');
+        Serial.print(',');
+        Serial.print(f.header.first_index + (uint32_t)i * (uint32_t)f.header.decim);
+        Serial.print(',');
+        Serial.print(p.gen);
+        for (uint8_t k = 0; k < f.header.n_channels; k++) {
+            Serial.print(',');
+            Serial.print(f.header.channels[k]);
+            Serial.print(':');
+            Serial.print(p.adc[k]);
+        }
+        Serial.println();
+        g_streamLines++;
+    }
+}
+
+static void handleStreamCommand(const char* cmd, uint8_t len) {
+    const char c = cmd[0];
+    if (c == 't' || c == 'T') {
+        g_streamOn = (len >= 2) ? (cmd[1] == '1') : !g_streamOn;
+        printStreamInfo();
+    } else if (c == '?') {
+        Serial.println("Commands: T = toggle the sample stream, T1/T0 = on/off, ? = this list.");
+    }
+}
+
+// The board's only input channel: line-terminated commands on USB serial.  Line
+// based on purpose, so a stray keystroke in the monitor cannot switch the stream
+// on accidentally.
+static void pollStreamCommand() {
+    static char    cmd[16];
+    static uint8_t n = 0;
+
+    while (Serial.available() > 0) {
+        const int c = Serial.read();
+        if (c < 0) { break; }
+        if (c == '\r' || c == '\n') {
+            if (n > 0u) {
+                cmd[n] = '\0';
+                handleStreamCommand(cmd, n);
+                n = 0;
+            }
+            continue;
+        }
+        if (c == ' ' || c == '\t') { continue; }
+        if (n < (uint8_t)(sizeof(cmd) - 1u)) {
+            cmd[n++] = (char)c;
+        } else {
+            n = 0;                          // overlong garbage: drop the line
+        }
+    }
+}
+
+// ===========================================================================
 // Arduino entry points (both cores call these)
 // ===========================================================================
 void setup() {
@@ -234,10 +388,10 @@ void setup() {
     if (RPC.cpu_id() == CM4_CPUID) {
         g_acqThread.start(acquisitionTask);
     } else {
-        RPC.attach(onMetricsRaw);   // M7: raw sink for M4 metric frames
+        RPC.attach(onM4RawFrame);   // M7: raw sink for M4 metric + sample frames
         Serial.println("M7 ready: acquisition + detection run on the M4.");
 #if SORTER_SIGNAL_GEN
-        Serial.print("BENCH MODE: the M4 drives DAC A12/A13 with a known pattern at ");
+        Serial.print("BENCH MODE: the M4 drives DAC A12/A13 with a synthetic waveform at ");
         Serial.print(SORTER_SAMPLE_RATE_HZ);
         Serial.print(" Hz, measuring channel mask 0x");
         Serial.print((unsigned)SORTER_ACTIVE_CHANNEL_MASK, HEX);
@@ -246,14 +400,16 @@ void setup() {
         Serial.print(" mode (primary channel ");
         Serial.print(SORTER_PRIMARY_CHANNEL);
         Serial.println(").");
-        Serial.println("Expected per 2 s pattern cycle: 3 VALID events (one 'ch' line per");
-        Serial.println("measured channel) + 3 rejected events.");
+        Serial.println("Waveform: a NEW random pulse train every pattern cycle - Gaussian");
+        Serial.println("peak heights/widths, uniform gaps, and a share of rectangular");
+        Serial.println("glitches that must be rejected (SIGNALGEN_* in config.h).");
 #endif
 #if SORTER_M7_HEARTBEAT_MS
         Serial.print("Heartbeat: a liveness line every ");
         Serial.print(SORTER_M7_HEARTBEAT_MS);
         Serial.println(" ms whenever no event has just been printed.");
 #endif
+        Serial.println("Sample stream (live plot): type T + Enter to start/stop it, ? for help.");
     }
 }
 
@@ -270,6 +426,24 @@ void loop() {
             g_m7Mail.free(r);
             lastOutputMs = millis();
             eventCount++;
+        }
+
+        // Commands from the host (T = toggle the sample stream, T1/T0 = on/off).
+        pollStreamCommand();
+
+        // Sample stream -> serial, only while it is switched on.  With streaming
+        // off the queued frames are simply dropped, so switching it on later starts
+        // from fresh samples instead of replaying stale ones.  The per-pass budget
+        // bounds the pass, so commands and the heartbeat stay responsive.
+        uint8_t budget = 8u;
+        sorter::StreamFrame* f;
+        while (budget > 0u && (f = g_streamMail.try_get()) != nullptr) {
+            if (g_streamOn) {
+                printStreamFrame(*f);
+                lastOutputMs = millis();   // streaming counts as output: no heartbeat
+                budget--;
+            }
+            g_streamMail.free(f);
         }
 
         // Liveness heartbeat: if nothing has been printed for a while, say so, so

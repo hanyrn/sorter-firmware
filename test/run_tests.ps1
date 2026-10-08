@@ -3,7 +3,7 @@
 $ErrorActionPreference = 'Stop'
 $here = $PSScriptRoot
 $inc  = Join-Path $here '..'
-$srcs = 'test_event_detector', 'test_event_aggregator'   # -> <name>.cpp
+$srcs = 'test_event_detector', 'test_event_aggregator', 'test_signal_model'   # -> <name>.cpp
 
 $cxx = $null
 foreach ($c in 'g++', 'clang++') {

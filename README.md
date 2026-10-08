@@ -56,9 +56,12 @@ does the **M7 pass first, then the M4 pass**, and why `-Split` exists.
 | `monitor.ps1` | Opens a serial terminal on the board via `arduino-cli monitor` |
 | `test/model_check.py` | Python mirror of the detector + synthetic validation |
 | `test/model_check_aggregator.py` | Python mirror of the aggregator (LINKED / PER_CHANNEL) |
+| `test/signal_model.py` | Python mirror of `signal_model.h` (bench waveform: pulses, gaps, glitches) |
 | `test/plot_signals.py` | Plots the AD7606 input waveform + detector verdicts (SVG/HTML, no deps) |
+| `test/live_plot.py` | Live viewer for the serial sample stream (`T` command) in the browser |
 | `test/test_event_detector.cpp` | C++ unit test for the detector (host) |
 | `test/test_event_aggregator.cpp` | C++ unit test for the aggregator (host) |
+| `test/test_signal_model.cpp` | C++ unit test for `signal_model.h` (host) |
 | `test/run_tests.ps1` | Builds & runs the C++ unit tests |
 | `test/verify_adc_pinmap.ps1` | Checks the AD7606 pin map (config.h vs README vs GIGA core) |
 
@@ -469,14 +472,34 @@ validated without the board:
   self-contained HTML/SVG (no Python packages required) plus a text summary, and
   opens the file in your default browser when it finishes (`--no-open` to skip).
   The default `--source dac` mirrors `signal_gen.cpp`'s `kPattern`; `--source model`
-  plots `model_check.py`'s signal.
+  plots `signal_model.py`, the mirror of `signal_model.h`.
+
+* **Live sample stream (needs the board, or `--sim`)**
+  ```powershell
+  py -3 test\live_plot.py --sim              # no board: signal_model.py generates
+  py -3 test\live_plot.py --port COM7        # the real board
+  ```
+  `live_plot.py` sends `T1` (the monitor's stream-on command, so the M7 always
+  re-prints its `STREAM` header) to switch the sample stream on, parses the
+  `S,<index>,<gen>,<ch>:<count>,...` lines and
+  pushes them over Server-Sent Events to a small page it serves on
+  `http://127.0.0.1:8000/` - a rolling window of the expected and measured traces
+  in AD7606 counts, the point rate, the newest sample index, and a text pane with
+  everything the board prints that is not a sample line (STREAM header, boot banner,
+  every closed event with its verdict). Pure stdlib plus your browser: no `pyserial`,
+  no npm. Ctrl+C sends `T0` so the 1000 lines/s flood stops again
+  (`--keep-streaming` leaves it running). `--sim` paces `signal_model.py` in real
+  time and feeds the `model_check.py` detector, so the viewer can be exercised with
+  nothing plugged in; `--window`, `--range`, `--channels`, `--http-port` and
+  `--sim-speed` tune it.
 
 * **C++ unit tests (need g++/clang++)**
   ```powershell
   pwsh test\run_tests.ps1
   ```
-  Builds and runs `test_event_detector` and `test_event_aggregator` against the real
-  headers. If `g++`/`clang++` is not on `PATH`, the script also looks in the usual
+  Builds and runs `test_event_detector`, `test_event_aggregator` and
+  `test_signal_model` against the real headers. If `g++`/`clang++` is not on `PATH`,
+  the script also looks in the usual
   install locations (the winget WinLibs package, MSYS2, MinGW-w64) — install one with
   `winget install BrechtSanders.WinLibs.POSIX.UCRT` if needed. If PowerShell refuses
   to run the script, use `powershell -ExecutionPolicy Bypass -File test\run_tests.ps1`.

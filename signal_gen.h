@@ -1,38 +1,32 @@
 // signal_gen.h
 //
-// Cortex-M4 synthetic signal generator for bench-testing the event detector.
+// Cortex-M4 bench-test signal source: drives the GIGA's two 12-bit DAC outputs
+// (A12 = DAC1_OUT1, A13 = DAC1_OUT2) so the generated waveform can be looped
+// straight back into the AD7606 analog inputs.  That turns the complete chain
+// (parallel bus -> combine -> event detector -> RPC -> M7 printout) into a
+// hardware-in-the-loop test without any external signal source.
 //
-// It drives the GIGA's two 12-bit DAC outputs (A12 = DAC1_OUT1, A13 =
-// DAC1_OUT2) with a repeating, fully known waveform so that signal can be looped
-// straight back into the AD7606 analog inputs.  That makes the complete chain
-// (parallel bus -> combine -> event detector -> RPC -> M7 printout) testable on
-// real hardware without any external signal source.
+// The waveform itself - a train of randomly parameterised pulses on a DC baseline
+// with dither - lives in signal_model.h (Arduino-free, unit-tested, mirrored in
+// Python).  This class is only the DAC side of it: it owns the model and writes
+// each generated code to A12/A13 with analogWrite().
 //
 // tick() is called once per acquisition iteration, i.e. the generator is
-// *sample-locked* to the ADC: one DAC update per conversion, with no timer and
-// no interrupt.  Because each DAC code is held for a whole sample period, a
+// *sample-locked* to the ADC: one DAC update per conversion, with no timer and no
+// interrupt.  Because each DAC code is held for a whole sample period, a
 // conversion digitises the previous sample's settled value - a deterministic
 // one-sample delay that does not affect any peak metric.
 //
-// The waveform is a train of raised-cosine pulses (broad peaks) plus
-// rectangular spikes (deliberate false peaks) on a DC baseline with dither.
-// Amplitudes are expressed in AD7606 counts and converted to DAC codes with
+// Pulse amplitudes are expressed in AD7606 counts and converted to DAC codes with
 // SIGNALGEN_ADC_PER_DAC (see config.h).
 
 #pragma once
 
 #include <stdint.h>
 #include "config.h"
+#include "signal_model.h"
 
 namespace sorter {
-
-// One injected pulse. Amplitudes are AD7606 counts above the baseline.
-struct PulseSpec {
-    uint32_t start;      // first sample of the pulse inside the pattern cycle
-    uint32_t width;      // duration in samples
-    int32_t  amplitude;  // peak height above the baseline (AD7606 counts)
-    uint8_t  rect;       // 0 = raised-cosine (peak), 1 = rectangle (glitch)
-};
 
 class SignalGen {
 public:
@@ -46,18 +40,25 @@ public:
 
     void     enable(bool on) { enabled_ = on; }
     bool     enabled()  const { return enabled_; }
-    uint32_t position() const { return pos_; }     // sample index within the cycle
-    uint32_t cycles()   const { return cycles_; }  // completed pattern cycles
+
+    // The DAC code both outputs hold, i.e. the sample just generated.  This is
+    // also what the sample stream reports as the "expected" trace.
+    int32_t  code()     const { return model_.code(); }
+
+    uint32_t position() const { return model_.position(); }  // sample index in the cycle
+    uint32_t cycles()   const { return model_.cycles(); }    // completed pattern cycles
+
+    // The pulse train currently in use (redrawn at every cycle start), so a host
+    // tool can print/plot exactly what is being injected.
+    const PulseSpec* pulses()     const { return model_.pulses(); }
+    uint32_t         pulseCount() const { return model_.pulseCount(); }
 
 private:
-    void writeSample(uint32_t index);
+    void writeOutputs(int32_t code);
 
-    uint32_t pos_     = 0;
-    uint32_t cycles_  = 0;
-    uint32_t rng_     = SIGNALGEN_SEED;
-    float    dither_  = 0.0f;   // normalised (-1..1) dither state
-    bool     enabled_ = true;
-    bool     ready_   = false;
+    SignalModel model_;
+    bool        ready_   = false;
+    bool        enabled_ = true;
 };
 
 } // namespace sorter

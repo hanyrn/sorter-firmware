@@ -100,6 +100,28 @@
 #define SORTER_M7_HEARTBEAT_MS  2000u
 
 // ===========================================================================
+// Sample streaming (M4 -> M7 -> USB serial) -- the live plot window
+// ===========================================================================
+// Besides the per-event blocks, the M4 can ship raw waveform samples to the M7,
+// which prints them as `S,<index>,<code>[,<ch>:<value>...]` lines.  That is what
+// test/live_plot.py draws live, and it is the only way to *see* the synthetic
+// signal (and, once the modules are wired, the measured one) without a scope.
+//
+// Streaming is deliberately quiet by default: the M4 fills the frames
+// continuously, but the M7 prints them only once streaming has been switched on
+// from the host - `T` in the serial monitor, or live_plot.py, which sends it on
+// startup.  So the ordinary monitor output stays readable.
+//
+// Cost: SORTER_SAMPLE_RATE_HZ / SORTER_STREAM_DECIM points per second, each
+// carrying 2 + 2*SORTER_STREAM_CHANNELS bytes over the M4 -> M7 link; at the
+// defaults that is 1000 points/s (8 kB/s) in 16 frames/s.  One frame must stay
+// below the 512-byte RPMSG payload buffer - stream_sink.h asserts that.
+#define SORTER_STREAM_POINTS    64u   // points per frame
+#define SORTER_STREAM_DECIM     10u   // ship every Nth sample (10 = 1 kSPS at 10 kSPS)
+#define SORTER_STREAM_CHANNELS  2u    // measured channels carried, in mask order
+
+
+// ===========================================================================
 // AD7606 parallel buses -- Arduino GIGA R1 WiFi digital pins
 // ===========================================================================
 //
@@ -242,13 +264,51 @@ static const uint8_t AD7606_BUSY1_PIN  = A5;
 // ===========================================================================
 // Synthetic signal generator (bench test only, SORTER_SIGNAL_GEN = 1)
 // ===========================================================================
-// The pattern itself (pulse timings/shapes) lives in signal_gen.cpp (kPattern);
-// these values scale it into DAC codes.
+// The waveform itself - a train of randomly parameterised pulses on a DC baseline
+// - lives in signal_model.h (Arduino-free, unit-tested, mirrored in Python by
+// test/signal_model.py).  These values map that model onto the board.
+//
+// A NEW train is drawn at the start of every pattern cycle, so the detector keeps
+// meeting a fresh combination of peak heights, peak widths and gaps instead of
+// the same fixed pattern for ever:
+//
+//   gap between events   uniform in [GAP_MIN, GAP_MAX] samples
+//   peak width           Gaussian(WIDTH_MEAN, WIDTH_SD)   clipped to MIN..MAX
+//   peak height          Gaussian(HEIGHT_MEAN, HEIGHT_SD) clipped to MIN..MAX
+//   glitch width         uniform in 1..GLITCH_WIDTH_MAX samples
+//   glitch height        Gaussian(GLITCH_HEIGHT_MEAN, GLITCH_HEIGHT_SD)
+//   glitch share         GLITCH_PCT % of the pulses
+//
+// The glitches (rectangular, 1..6 samples) are the deliberate false peaks: they
+// keep DET_MIN_MAX_VALUE / DET_MIN_WIDTH_SAMPLES / DET_MAX_SLOPE exercised, so a
+// randomized train still shows the detector rejecting what it must reject.
+//
+// Keep these equal to the matching defaults in SignalModel::Config (signal_model.h)
+// - the host unit test builds the model from those defaults.
 #define SIGNALGEN_CYCLE_SAMPLES  20000u  // pattern length (2.0 s at 10 kSPS)
 #define SIGNALGEN_BASELINE_CODE  2048    // DC level in DAC codes (~1.65 V)
 #define SIGNALGEN_NOISE_CODE     6       // dither amplitude in DAC codes (~4.8 mV)
 #define SIGNALGEN_NOISE_ALPHA    1.0f    // dither low-pass weight (1.0 = white)
 #define SIGNALGEN_SEED           0x2F6E2B1u
+
+#define SIGNALGEN_MAX_PULSES       16u     // never more pulses than this per cycle
+#define SIGNALGEN_CYCLE_MARGIN     600u    // keep pulses clear of the cycle boundary
+#define SIGNALGEN_GAP_MIN          700u    // time between events (samples)
+#define SIGNALGEN_GAP_MAX          3200u
+#define SIGNALGEN_WIDTH_MEAN       1200.0f // peak width (samples)
+#define SIGNALGEN_WIDTH_SD         260.0f
+#define SIGNALGEN_WIDTH_MIN        300u
+#define SIGNALGEN_WIDTH_MAX        3000u
+#define SIGNALGEN_HEIGHT_MEAN      900.0f  // peak height (AD7606 counts)
+#define SIGNALGEN_HEIGHT_SD        300.0f
+#define SIGNALGEN_HEIGHT_MIN       150
+#define SIGNALGEN_HEIGHT_MAX       3500
+#define SIGNALGEN_GLITCH_PCT       25u     // % of pulses that are glitches
+#define SIGNALGEN_GLITCH_WIDTH_MAX 6u      // glitch width uniform in 1..this
+#define SIGNALGEN_GLITCH_HEIGHT_MEAN 1200.0f
+#define SIGNALGEN_GLITCH_HEIGHT_SD   600.0f
+#define SIGNALGEN_GLITCH_HEIGHT_MIN  200
+#define SIGNALGEN_GLITCH_HEIGHT_MAX  3500
 
 // The DAC output buffer is only linear from roughly 0.2 V to VDDA-0.2 V, so keep
 // the generated code inside this window (250 .. 3850 of 0 .. 4095).

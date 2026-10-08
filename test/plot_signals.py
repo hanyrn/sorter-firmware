@@ -7,12 +7,13 @@ Two selectable sources:
 
   dac    (default) the exact waveform the M4 drives out of its two 12-bit DACs
          in the bench loopback (SORTER_SIGNAL_GEN = 1).  This is a mirror of
-         signal_gen.cpp: the same kPattern pulses, the same 256-entry
-         raised-cosine LUT and the same xorshift dither.  In the loopback those
-         DAC pins are wired straight into the AD7606 inputs, so this is
-         literally the voltage the modules will sample.  Two pattern cycles are
-         run and the second is plotted, so the detector is past its 3000-sample
-         warmup (on the real board P1 @ sample 2000 is only caught once armed).
+         signal_model.h - test/signal_model.py is that mirror: the same randomly
+         drawn pulse train, the same 256-entry raised-cosine LUT and the same
+         xorshift dither.  In the loopback those DAC pins are wired straight into
+         the AD7606 inputs, so this is literally the voltage the modules will
+         sample.  Two pattern cycles are run and the second is plotted, so the
+         detector is past its 3000-sample warmup; a fresh train is drawn for every
+         2.0 s cycle, and the one the plotted cycle uses is listed on stdout.
 
   model  the synthetic detector cross-check signal from model_check.py
          (baseline + Gaussian noise + three broad peaks + two glitches).
@@ -45,22 +46,17 @@ import webbrowser
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import model_check as mc           # noqa: E402  (detector mirror + reason codes)
+import signal_model as sm          # noqa: E402  (waveform mirror of signal_model.h)
 
-# --- constants mirrored from config.h / signal_gen.cpp -----------------------
+# --- constants mirrored from config.h ---------------------------------------
 SAMPLE_RATE_HZ = 10000             # SORTER_SAMPLE_RATE_HZ
 DT_US          = 1000000 // SAMPLE_RATE_HZ
 
-# signal_gen.cpp (SIGNALGEN_* in config.h)
-CYCLE_SAMPLES  = 20000             # SIGNALGEN_CYCLE_SAMPLES  (2.0 s @ 10 kSPS)
-MODEL_SAMPLES  = 26000             # model_check.py main() length (covers the peak @ 20000)
-BASELINE_CODE  = 2048              # SIGNALGEN_BASELINE_CODE  (~1.65 V)
-NOISE_CODE     = 6                 # SIGNALGEN_NOISE_CODE     (~4.8 mV)
-NOISE_ALPHA    = 1.0               # SIGNALGEN_NOISE_ALPHA    (1.0 = white)
-SEED           = 0x2F6E2B1         # SIGNALGEN_SEED
-MIN_CODE       = 250               # SIGNALGEN_MIN_CODE
-MAX_CODE       = 3850              # SIGNALGEN_MAX_CODE
-LUT_SIZE       = 256
-ADC_PER_DAC    = 2.64              # SIGNALGEN_ADC_PER_DAC (code scaling at +/-10 V)
+# The waveform itself (all the SIGNALGEN_* knobs in config.h) lives in exactly one
+# place: test/signal_model.py, the Python mirror of signal_model.h.  Only the cycle
+# length and the model_check.py signal length are needed here.
+CYCLE_SAMPLES  = sm.DEFAULTS['cycle_samples']   # SIGNALGEN_CYCLE_SAMPLES
+MODEL_SAMPLES  = 26000             # model_check.py main() length (covers its peak @ 20000)
 
 # The GIGA's 12-bit DAC: 0..4095 over the ~3.3 V VDDA rail.
 DAC_MAX_CODE   = 4095
@@ -68,19 +64,6 @@ DAC_VREF       = 3.3
 
 # AD7606 is 16-bit signed: +/-32768 counts across the selected full scale.
 AD7606_FULL_SCALE_COUNTS = 32768
-
-# (start, width, amplitude_in_AD7606_counts, 'cos'|'rect') == signal_gen.cpp kPattern
-PATTERN = [
-    ( 2000, 1100,  800, 'cos'),    # P1 broad peak      -> VALID
-    ( 6000,  900, 1200, 'cos'),    # P2 broad peak      -> VALID
-    (11000, 1400,  500, 'cos'),    # P3 broad peak      -> VALID
-    (15000,    4,  900, 'rect'),   # G1 spike           -> SHORT_FOR_HEIGHT
-    (17000,    2, 4000, 'rect'),   # G2 spike           -> SHORT_FOR_HEIGHT
-                                   #   (signal_gen.cpp's comment says WIDTH_TOO_NARROW;
-                                   #   the mirror measures width=3, which is not below
-                                   #   the min, so the slope test fires first instead)
-    (18500,   20,   60, 'rect'),   # G3 small bump      -> MAX_TOO_SMALL
-]
 
 REASON_NAME = {
     mc.REASON_OK:               'VALID',
@@ -99,47 +82,17 @@ REASON_SHORT = {
     mc.REASON_SHORT_FOR_HEIGHT: 'short for height',
 }
 
-def _raise_cosine_lut():
-    return [0.5 * (1.0 - math.cos(2.0 * math.pi * i / LUT_SIZE))
-            for i in range(LUT_SIZE)]
+# (The fixed `kPattern` table that used to live here is gone: the train is drawn at
+# run time by SignalModel::buildTrain(), so test/signal_model.py is the only place
+# the waveform is described in Python.)
 
 
-def build_dac_codes(total=CYCLE_SAMPLES):
-    """Mirror of signal_gen.cpp: DAC codes (0..4095) for `total` samples.
+def build_dac_codes(cycles=2):
+    """The DAC codes (0..4095) the M4 writes for `cycles` pattern cycles.
 
-    The bench pattern repeats every CYCLE_SAMPLES (SignalGen::pos_ wraps) while
-    the dither RNG keeps running, so a multi-cycle stream is continuous.
+    Returns (model, codes); `model.pulses` is the train used for the last cycle.
     """
-    shape = _raise_cosine_lut()
-    pulse_dac = [amp / ADC_PER_DAC for (_, _, amp, _) in PATTERN]
-    codes = []
-    rng = SEED
-    dither = 0.0
-    for i in range(total):
-        pos = i % CYCLE_SAMPLES
-        # --- SignalGen::tick(): xorshift32 dither, white at alpha = 1.0 ------
-        rng = (rng ^ ((rng << 13) & 0xFFFFFFFF)) & 0xFFFFFFFF
-        rng = (rng ^ (rng >> 17)) & 0xFFFFFFFF
-        rng = (rng ^ ((rng << 5) & 0xFFFFFFFF)) & 0xFFFFFFFF
-        signed = rng if rng < 0x80000000 else rng - 0x100000000
-        white = signed / 2147483648.0
-        dither += NOISE_ALPHA * (white - dither)
-
-        # --- SignalGen::writeSample(pos) -------------------------------------
-        v = BASELINE_CODE + dither * NOISE_CODE
-        for idx, (start, width, _amp, kind) in enumerate(PATTERN):
-            if pos < start or pos >= start + width:
-                continue
-            if kind == 'rect':
-                v += pulse_dac[idx]
-            else:
-                u = ((pos - start) * LUT_SIZE) // width
-                if u >= LUT_SIZE:
-                    u = LUT_SIZE - 1
-                v += pulse_dac[idx] * shape[u]
-        v = min(MAX_CODE, max(MIN_CODE, v))
-        codes.append(int(math.floor(v + 0.5)))       # C uses lroundf
-    return codes
+    return sm.build_cycles(cycles)
 
 
 def codes_to_volts(codes):
@@ -318,9 +271,10 @@ def main():
                     help="don't launch the generated file in the default browser")
     args = ap.parse_args()
 
+    train_lines = []
     if args.source == 'dac':
         # Two pattern cycles; analyse the second so the detector is past warmup.
-        codes = build_dac_codes(2 * CYCLE_SAMPLES)
+        gen, codes = build_dac_codes(2)
         volts_all = codes_to_volts(codes)
         counts_all = volts_to_counts(volts_all, args.range)
         events_all, det = run_detector(counts_all, DT_US)
@@ -329,10 +283,13 @@ def main():
         counts = counts_all[off:off + CYCLE_SAMPLES]
         events = [{'start': e['start'] - off, 'end': e['end'] - off, 'm': e['m']}
                   for e in events_all if e['start'] >= off]
-        title = 'DAC loopback (signal_gen.cpp kPattern)'
+        title = 'DAC loopback (randomized train, signal_model.h)'
         note = ('Voltage is the M4 DAC output, which the AD7606 input is wired to in the '
                 'bench loopback (SORTER_SIGNAL_GEN = 1). The second pattern cycle is shown, '
-                'so the detector is past its 3000-sample warmup.')
+                'so the detector is past its 3000-sample warmup; the train drawn for that '
+                'cycle (SIGNALGEN_SEED = 0x%X) is listed below.'
+                % sm.DEFAULTS['seed'])
+        train_lines = sm.describe_train(gen, 'pulses drawn for the plotted cycle')
     else:
         counts = build_model_signal()
         volts = counts_to_volts(counts, args.range)
@@ -369,6 +326,11 @@ def main():
 
     with open(args.out, 'w', encoding='utf-8') as f:
         f.write(build_html(charts, meta))
+
+    for line in train_lines:
+        print(line)
+    if train_lines:
+        print('')
 
     print('source : %s' % title)
     print('range  : +/-%g V  (%d counts full scale)' % (args.range, AD7606_FULL_SCALE_COUNTS))
