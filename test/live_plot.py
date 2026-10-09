@@ -18,7 +18,7 @@ build step.
 
     py -3 test/live_plot.py --sim              # no board: signal_model.py generates
     py -3 test/live_plot.py --port COM7        # the real board
-    py -3 test/live_plot.py --sim --window 2000 --http-port 9000
+    py -3 test/live_plot.py --sim --window 2 --http-port 9000
 
 --sim ticks the Python mirror of the bench waveform (test/signal_model.py) at the
 same 10 kSPS the firmware uses, feeds the detector mirror from model_check.py and
@@ -32,8 +32,22 @@ time and `0` for no pacing at all, handy for filling a small window quickly).
 The page shows
 
   * the generated ("expected") trace and the measured channels in AD7606 counts,
-    over the last --window points (default 4000 = 4 s at the default decimation),
+    over a rolling *time* window - `--window` seconds, one by default, adjustable
+    with the page's slider (from 0.1 s up to the `--history` seconds kept per trace,
+    8 by default and capped at 60 s).  Time, not a point count, is what keeps the pane
+    readable: the same second of stream whatever the board's rate, so events cannot
+    pile up in it, and widening the window redraws from samples already in hand,
   * the point rate and the newest sample index (sample index / 10 kSPS = seconds),
+  * every closed event drawn over the traces as the detector's decision: the window
+    it claimed (its width in samples), the baseline it froze for that window and the
+    peak it reported on top of that baseline, coloured by the verdict - so a pulse
+    buried in noise, or two pulses merged into one window, can be judged against the
+    same numbers the log prints (`detector overlay` unticks it),
+  * the two things those lines cannot show, read back off the plotted points and
+    tagged in colours of their own: `2 peaks  dip +58` when one window swallowed two
+    peaks, and `!max` / `?max` when the window's own samples do not reach the max it
+    reported (an impulse the decimation dropped, most often).  Both describe the
+    trace, never replace the measured numbers - see *Live sample stream* below.
   * a text pane with everything the board prints that is not a sample line: the
     STREAM metadata line, the boot banner and every closed event with its verdict,
     so a run can be read back afterwards.
@@ -52,6 +66,7 @@ import json
 import math
 import os
 import queue
+import re
 import sys
 import threading
 import time
@@ -68,6 +83,25 @@ DT_US          = 1000000 // SAMPLE_RATE_HZ
 DECIM          = 10                # SORTER_STREAM_DECIM
 POINTS         = 64                # SORTER_STREAM_POINTS (points per frame)
 CHANNELS       = 2                 # SORTER_STREAM_CHANNELS
+EVENT_KEEP     = 400               # detector decisions kept for the page's overlay
+
+# The page's rolling window, in seconds.  A *time* window rather than a point count
+# keeps the pane readable: the same second of stream, whatever the board's rate, so
+# events cannot pile up in it.  --window is where the slider opens, --history is how
+# much is kept per trace - that is what lets the window be widened without waiting
+# for new samples (and what a newly opened tab is primed with).
+VIEW_SEC       = 1.0
+HISTORY_SEC    = 8.0
+MIN_VIEW_SEC   = 0.1               # the slider's floor, in seconds
+MAX_KEEP_SEC   = 60.0              # .. and the ceiling on --history: beyond it the
+                                   # sample buffers here and in the browser cost more
+                                   # than a window that wide could ever show
+POINTS_PER_SEC = SAMPLE_RATE_HZ // DECIM       # 1000 at the defaults
+
+
+def view_points(seconds):
+    """Points per trace `seconds` of stream is worth at the default decimation."""
+    return max(2 * POINTS, int(round(seconds * POINTS_PER_SEC)))
 
 # The GIGA's 12-bit DAC and the AD7606's 16-bit signed output.
 DAC_MAX_CODE = 4095
@@ -98,6 +132,17 @@ REASON_NAME = {
     mc.REASON_RAILED:           'RAILED',
 }
 
+# printBundle() in sorter-firmware.ino: the two lines a closed event prints.  The
+# head carries the window and the verdict, the channel line the numbers behind it.
+#
+#   Event #12  VALID     reason=0 OK  window=1234..5678us/24smp  primary=ch0  mode=linked
+#     ch0  max=1042  area=12033  width=2400us/24smp  base=5412  VALID
+EVENT_HEAD = re.compile(r'^Event #(\d+)\s+(VALID|rejected)\s+reason=(\d+)\s+(\S+)'
+                        r'\s+window=(\d+)\.\.(\d+)us/(\d+)smp\s+primary=ch(\d+)'
+                        r'\s+mode=(\S+)')
+EVENT_CHANNEL = re.compile(r'^ch(\d+)\s+max=(-?\d+)\s+area=(\d+)\s+width=(\d+)us/'
+                           r'(\d+)smp\s+base=(-?\d+)\s+(\S+)(?:\s+(\S+))?')
+
 
 def volts_to_counts(volts, range_v):
     """What the AD7606 reports for an input voltage (RANGE strap full scale)."""
@@ -117,14 +162,22 @@ class StreamState:
     every browser request calls subscribe() and then drains its own queue, which
     keeps a slow client from stalling the producer.  A queue that overflows is
     dropped: the page then simply misses that slice and keeps going.
+
+    `window` is how many points per trace are kept - enough for `keep_sec` seconds
+    of stream, which is the widest window the page's slider offers; `window_sec` is
+    what that slider reads when the page opens.  Both travel in the meta line, so a
+    page served from the command line and the samples it is primed with agree.
     """
 
-    def __init__(self, window):
+    def __init__(self, window, window_sec=VIEW_SEC, keep_sec=HISTORY_SEC):
         self.window = window
+        self.window_sec = window_sec
+        self.keep_sec   = keep_sec
         self.lock   = threading.Lock()
         self.subs   = []
         self.meta   = None            # dict sent to the page as soon as it connects
         self.recent = collections.deque(maxlen=window)   # (index, gen, [adc, ...])
+        self.events = collections.deque(maxlen=EVENT_KEEP)  # detector decisions
         self.points = 0               # points seen since the start
         self.frames = 0
         self.t0     = time.time()
@@ -147,6 +200,12 @@ class StreamState:
         self.publish({'kind': 'data', 'i': first_index, 'n': n,
                       'gen': gen, 'adc': adc})
 
+    def add_event(self, ev):
+        """One detector decision: the window, its width, the baseline and the peak."""
+        with self.lock:
+            self.events.append(ev)
+        self.publish(dict(ev, kind='event'))
+
     def log(self, line):
         if line:
             self.publish({'kind': 'log', 'line': line})
@@ -159,6 +218,7 @@ class StreamState:
             self.subs.append(q)
             meta = dict(self.meta) if self.meta else None
             snapshot = list(self.recent)
+            events = list(self.events)
         if meta:
             q.put_nowait(dict(meta, kind='meta'))
         if snapshot:
@@ -166,6 +226,8 @@ class StreamState:
                           'gen': [s[1] for s in snapshot],
                           'adc': [[s[2][c] for s in snapshot]
                                   for c in range(len(snapshot[0][2]))]})
+        if events:
+            q.put_nowait({'kind': 'events', 'list': events})
         return q
 
     def unsubscribe(self, q):
@@ -194,15 +256,19 @@ class StreamState:
 class StreamParser:
     """Turns the M7's serial bytes into batches for StreamState.
 
-    Only two line shapes matter to the plot:
+    Three line shapes matter to the page:
 
         STREAM on: decim=10 chans=0,1 wf=1 points=64      metadata (sent by `T`)
         S,<sample index>,<gen code>,<ch>:<count>,...      one sample point
+        Event #12  VALID  reason=0 OK  window=...         a closed event, plus
+          ch0  max=...  area=...  width=...  base=...       its per-channel line
 
     Points are collected until a whole frame is in - the M7 prints a frame's points
     back to back, so either a contiguous sample index or SORTER_STREAM_POINTS
-    points means "frame done" - and everything else is passed through as log text:
-    the boot banner, the STREAM line and every closed event with its verdict.
+    points means "frame done".  Event lines are parsed into the decision the page
+    draws over the traces (window, width, baseline, peak, verdict); everything else
+    is passed through as log text: the boot banner, the STREAM line and every event
+    line, so the log pane still reads like a monitor session.
     """
 
     def __init__(self, state, source, range_v, echo=True):
@@ -218,6 +284,8 @@ class StreamParser:
         self.decim    = DECIM
         self.channels = []
         self.wf       = 0
+        self.pending  = None                  # Event # head waiting for its ch line
+        self.sample_rate = SAMPLE_RATE_HZ      # events arrive in us; traces count samples
 
     # ---- bytes -> lines ----------------------------------------------------
     def feed_bytes(self, data):
@@ -227,13 +295,17 @@ class StreamParser:
             self.feed_line(line.strip())
 
     def feed_line(self, line):
+        line = line.strip()                  # callers may hand us the raw text
         if not line:
             return
         if line.startswith('S,'):
+            self.flush_event()               # a sample line ends an open event group
             self._point(line)
         elif line.startswith('STREAM '):
+            self.flush_event()
             self._info(line)
         else:
+            self._event(line)                # also keeps the line in the log pane
             self.log(line)
 
     def log(self, line):
@@ -241,6 +313,82 @@ class StreamParser:
         if self.echo:
             print(line, flush=True)
         self.state.log(line)
+
+    def us_to_sample(self, us):
+        """The sample index a microsecond timestamp falls on.
+
+        The board stamps events with micros() while the stream counts samples, so
+        this is the paced grid rather than an exact index: the loop re-syncs its
+        time grid when it runs late, which drifts a few samples apart over a long
+        run - far less than a pixel at the window the page shows.
+        """
+        return int(round(us * self.sample_rate / 1000000.0))
+
+    # ---- the decision behind the log lines ---------------------------------
+    def _event(self, line):
+        """Parse one closed event into what the page overlays on the traces.
+
+        The head line arrives first, then one line per active channel - printBundle()
+        prints the whole group in one go.  The channel lines are held until the
+        window's *primary* channel reports, because that is the channel whose
+        crossing opened the window and whose numbers the verdict was computed from.
+        A RAILED or absent channel prints no numbers; the group is then closed with
+        whichever channel did report, and the tag names it.
+        """
+        m = EVENT_HEAD.match(line)
+        if m:
+            self.flush_event()               # the previous group ended unfinished
+            self.pending = {
+                'index':     int(m.group(1)),
+                'valid':     1 if m.group(2) == 'VALID' else 0,
+                'reason':    int(m.group(3)),
+                'reason_name': m.group(4),
+                'mode':      m.group(9),
+                'primary':   int(m.group(8)),
+                'start':     self.us_to_sample(int(m.group(5))),
+                'end':       self.us_to_sample(int(m.group(6))),
+                'width_smp': int(m.group(7)),
+                'chs':       [],
+            }
+            return True
+
+        c = EVENT_CHANNEL.match(line)
+        if c is not None and self.pending is not None:
+            ch = {
+                'channel':     int(c.group(1)),
+                'max':         int(c.group(2)),
+                'area':        int(c.group(3)),
+                # This channel's own width.  In the default LINKED mode it equals the
+                # window above; in per-channel mode a channel can be narrower, and
+                # the window span is the only extent the lines pin down.
+                'width_smp':   int(c.group(5)),
+                'base':        int(c.group(6)),
+                'verdict':     c.group(7),
+                'reason_name': c.group(8) or c.group(7),
+            }
+            self.pending['chs'].append(ch)
+            if ch['channel'] == self.pending['primary']:
+                self.flush_event()
+            return True
+
+        if self.pending is not None and line.startswith('ch'):
+            self.flush_event()               # RAILED / absent: no numbers to draw
+        return False
+
+    def flush_event(self):
+        """Hand the decision collected so far to StreamState.
+
+        The primary channel's numbers win; if a group never reported them (it
+        railed, or the stream was cut short), the first channel that did report is
+        used so the window still gets an overlay.
+        """
+        pend, self.pending = self.pending, None
+        if pend is None or not pend['chs']:
+            return
+        chans = pend.pop('chs')
+        primary = pend.pop('primary')
+        pend.update(next((c for c in chans if c['channel'] == primary), chans[0]))
+        self.state.add_event(pend)
 
     # ---- the two interesting lines -----------------------------------------
     def _info(self, line):
@@ -260,7 +408,8 @@ class StreamParser:
                             points=int(fields.get('points', POINTS)),
                             sample_rate=SAMPLE_RATE_HZ, range=self.range_v,
                             gen_scale=gen_scale_counts(self.range_v),
-                            window=self.state.window)
+                            window_s=self.state.window_sec,
+                            keep_s=self.state.keep_sec)
         self.log(line)
 
     def _point(self, line):
@@ -380,7 +529,13 @@ class SimSource:
         self.speed   = speed
         self.nch     = channels
         self.parser  = StreamParser(state, 'sim', range_v)
-        self.model   = sm.SignalModel(**overrides)
+        # --range selects the AD7606 RANGE strap, and the firmware's matching
+        # SIGNALGEN_ADC_PER_DAC has to be set the same way (2.64 at +/-10 V, 5.28 at
+        # +/-5 V - see config.h).  Mirror that here: the model works in counts per
+        # DAC code, so with the wrong factor a +/-5 V run would report every peak at
+        # twice its programmed height.
+        self.model   = sm.SignalModel(adc_per_dac=gen_scale_counts(range_v),
+                                      **overrides)
         self.det     = mc.EventDetector(mc.Config())
         self.dither  = sm.SignalModel(seed=SIM_SEED)   # only for its Gaussian noise
         self.thread  = None
@@ -456,15 +611,25 @@ class SimSource:
                                              in enumerate(counts))))
 
     def _event_text(self, m):
-        """The M7's own wording, so the log pane reads like a monitor session."""
-        self.parser.log('Event #%u  %sreason=%u %s  window=%dus/%dsmp  primary=ch0'
-                        % (m['index'], 'VALID     ' if m['valid'] else 'rejected  ',
-                           m['reason'], REASON_NAME[m['reason']], m['width_us'],
-                           m['width_samples']))
-        self.parser.log('  ch0  max=%d  area=%d  width=%dus/%dsmp  base=%.0f  %s'
-                        % (m['max_value'], int(m['area']), m['width_us'],
-                           m['width_samples'], m['baseline'],
-                           'VALID' if m['valid'] else 'rejected'))
+        """The M7's own wording, so the log pane reads like a monitor session.
+
+        Word for word printBundle() in sorter-firmware.ino, window included: the
+        parser turns these two lines into the decision overlay the page draws, so
+        feeding them through feed_line() is what makes the simulator exercise the
+        very path the board's serial text takes.
+        """
+        self.parser.feed_line('Event #%d  %sreason=%d %s  window=%d..%dus/%dsmp  '
+                              'primary=ch0  mode=linked'
+                              % (m['index'],
+                                 'VALID     ' if m['valid'] else 'rejected  ',
+                                 m['reason'], REASON_NAME[m['reason']],
+                                 m['start_us'], m['start_us'] + m['width_us'],
+                                 m['width_samples']))
+        self.parser.feed_line('  ch0  max=%d  area=%d  width=%dus/%dsmp  base=%.0f  %s'
+                              % (m['max_value'], int(m['area']), m['width_us'],
+                                 m['width_samples'], m['baseline'],
+                                 'VALID' if m['valid']
+                                 else 'rejected ' + REASON_NAME[m['reason']]))
 
     def stop(self):
         self.stopped.set()
@@ -491,6 +656,9 @@ PAGE = """<!doctype html>
   .sw   { display: inline-block; width: 12px; height: 12px; margin-right: 4px;
           border: 1px solid #999; vertical-align: -1px; }
   canvas { display: block; border: 1px solid #ddd; }
+  #view  { width: 150px; vertical-align: -3px; }
+  #viewout { display: inline-block; min-width: 58px; color: #555;
+             font-variant-numeric: tabular-nums; }
   #log  { font-family: Consolas, 'Courier New', monospace; font-size: 11px;
           line-height: 1.35; height: 190px; overflow: auto; margin-top: 8px;
           padding: 6px; border: 1px solid #ddd; background: #fafafa; }
@@ -504,26 +672,87 @@ PAGE = """<!doctype html>
 <div class="bar" id="stats">&nbsp;</div>
 <canvas id="plot" width="1140" height="430"></canvas>
 <div class="bar">
+  <label>window <input type="range" id="view" min="0.1" max="__HISTORY__" step="0.1"
+                       value="__VIEW__"><span id="viewout">__VIEW__ s</span></label>
   <label><input type="checkbox" id="autoy" checked> auto Y</label>
+  <label><input type="checkbox" id="fullscale"> full scale</label>
   <label><input type="checkbox" id="showgen" checked> expected waveform</label>
+  <label><input type="checkbox" id="showevents" checked> detector overlay</label>
   <label><input type="checkbox" id="pause"> pause</label>
   <label><input type="checkbox" id="clear"> clear</label>
 </div>
 <div id="log"></div>
 <script>
 'use strict';
-const WINDOW  = __WINDOW__;      // points kept per trace
+const VIEW_S  = __VIEW__;        // rolling window the page opens with, seconds
+let   KEEP_S  = __HISTORY__;     // seconds kept per trace: the slider's ceiling
+const MIN_VIEW_S = 0.1;          // .. and its floor (the slider's min attribute)
 const COLORS  = __COLORS__;      // one colour per measured channel
 const RANGE_V = __RANGE__;       // AD7606 input range (full scale = +/-RANGE_V V)
+const ADC_FULL_SCALE = 32768;    // counts the AD7606 reports at that full scale
+const ML = 78, MR = 16, MT = 26, MB = 36;             // canvas margins
+// Detector overlay.  These are deliberately *not* in TRACE_COLORS: an annotation
+// must never be mistaken for a measured channel.  Accepted windows are deep green,
+// rejected ones orange, and the baseline the detector froze is deep violet.
+const EV_OK = '#1b5e20', EV_BAD = '#e65100', EV_BASE = '#4a148c';
+const EV_FILL_OK = 'rgba(27,94,32,0.10)', EV_FILL_BAD = 'rgba(230,81,0,0.10)';
+/* The two ways a window can be technically right and still hide the truth, each in a
+   colour of its own so neither reads as a measured channel:
+     EV_DIP     - the trace falls between two peaks, i.e. one window covers a pair;
+     EV_SUPPORT - the reported max is more than the trace can carry: no plotted sample
+                  comes near it, or the one that does stands alone.  An impulse is the
+                  usual reason (the decimation dropped it), a pulse sharper than the
+                  trace can draw is the other - the marker says "look here", not
+                  "impulse did it". */
+const EV_DIP = '#00695c', EV_SUPPORT = '#0277bd';
+const EV_LOBES    = 2;      // excursions above half height that make "more than one"
+const EV_DIP_PTS  = 2;      // plotted points an excursion has to hold, either way
+const EV_DIP_DROP = 0.4;    // of a peak's own height: how far down it is over
+const EV_MAX_PTS  = 4;      // plotted points a window needs for max= to be judged
+const EV_MAX_MISS = 0.25;   // .. and how far short of the reported max is too far
+const EV_NEAR_SPAN = 0.15;  // of that window, each side of the apex: "the shape"
+const EV_SPIKE_PTS = 6;     // plotted points a lone apex has to sit inside first
+const EV_LANES = 3;              // tag rows packed along the top of the pane
+const EV_KEEP = 400;             // decisions kept in the page (mirrors EVENT_KEEP)
+const FRAME_PTS = 64;            // points in one stream frame (mirrors POINTS)
 
 const el = (id) => document.getElementById(id);
 const cv = el('plot'), g = cv.getContext('2d');
 
-let meta = { channels: [], decim: 10, sample_rate: 10000, window: WINDOW,
-             range: RANGE_V, wf: 0, streaming: false, source: '?' };
+let meta = { channels: [], decim: 10, sample_rate: 10000, range: RANGE_V,
+             window_s: VIEW_S, keep_s: KEEP_S,
+             wf: 0, streaming: false, source: '?' };
 let gen = null, chans = [];
-let showGen = true, autoY = true, paused = false, frozen = null;
+let showGen = true, autoY = true, fullScale = false, paused = false, frozen = null;
+let showEvents = true, events = [];      // detector decisions, oldest first
+let flagTally = { judged: 0, dip: 0, max: 0 };  // windows the trace disagreed with
 let received = 0, t0 = 0, rate = 0, newest = null, dirty = true, lastDraw = 0;
+let viewSec = VIEW_S, viewTouched = false;   // the rolling window, in seconds
+
+/* Points per second the page receives: the window and the kept buffer are both
+   measured in *time*, so the point counts behind them follow the board's decimation. */
+const pps = () => {
+  const sr = meta.sample_rate || 10000, d = meta.decim || 1;
+  return Math.max(1e-9, sr / d);
+};
+
+/* How much is kept per trace - the widest window the slider offers. */
+const keepPoints = () => Math.max(2 * FRAME_PTS, Math.round((meta.keep_s || KEEP_S) * pps()));
+
+/* The rolling window itself, in plotted points. */
+const viewPoints = () => Math.max(2, Math.round(viewSec * pps()));
+
+/* Seconds the page holds: keepPoints() has a floor of two frames, so at the very
+   shortest settings this is a shade more than KEEP_S - the slider follows it. */
+const keepSeconds = () => keepPoints() / pps();
+
+/* Keep the slider and its readout honest: how far it may go, and where it is. */
+function syncView(){
+  const sl = el('view');
+  sl.max   = keepSeconds().toFixed(1);
+  sl.value = Math.min(viewSec, keepSeconds());
+  el('viewout').textContent = viewSec.toFixed(2) + ' s';
+}
 
 function newSeries(label, dashed, color){
   return { label: label, first: null, vals: [], dashed: dashed, color: color };
@@ -534,6 +763,8 @@ function buildSeries(){
             newSeries('ch' + c, false, COLORS[k % COLORS.length]));
   gen   = newSeries('expected', true, '#1565c0');
   received = 0; t0 = performance.now(); newest = null; frozen = null;
+  events = [];
+  flagTally = { judged: 0, dip: 0, max: 0 };
   renderLegend();
 }
 
@@ -551,15 +782,36 @@ function renderLegend(){
   sp.appendChild(sw);
   sp.appendChild(document.createTextNode(' expected (DAC code x scale)'));
   lg.appendChild(sp);
+  const ep = document.createElement('span'), esw = document.createElement('span');
+  esw.className = 'sw'; esw.style.background = 'rgba(27,94,32,0.35)';
+  ep.appendChild(esw);
+  ep.appendChild(document.createTextNode(' detector window'));
+  const bsw = document.createElement('span');
+  bsw.className = 'sw'; bsw.style.background = EV_BASE;
+  ep.appendChild(bsw);
+  ep.appendChild(document.createTextNode(
+    ' frozen baseline, reported max (dashed; green accepted, orange rejected)'));
+  /* .. plus the two things only the trace can show: a dip between two peaks, and a
+     max no sample of the window can reach. */
+  const dsw = document.createElement('span');
+  dsw.className = 'sw'; dsw.style.background = EV_DIP;
+  ep.appendChild(dsw);
+  const msw = document.createElement('span');
+  msw.className = 'sw'; msw.style.background = EV_SUPPORT;
+  ep.appendChild(msw);
+  ep.appendChild(document.createTextNode(
+    ' dip between peaks / max above the trace'));
+  /* The overlay key is only meaningful while the overlay is on. */
+  if (showEvents) lg.appendChild(ep);
 }
 
 function metaText(){
   const sr = meta.sample_rate || 0, d = meta.decim || 1;
-  const span = sr > 0 ? meta.window * d / sr : 0;
   return 'source ' + meta.source
        + '   ' + (meta.streaming ? 'stream on' : 'stream off')
        + '   ' + (sr / 1000).toFixed(1) + ' kSPS, decim ' + d
-       + '   window ' + meta.window + ' pts (' + span.toFixed(2) + ' s)'
+       + '   window ' + viewSec.toFixed(2) + ' s (' + viewPoints() + ' pts, '
+       + keepPoints() + ' kept = ' + keepSeconds().toFixed(1) + ' s)'
        + '   range +/-' + meta.range + ' V  (full scale +/-32768 counts)'
        + '   waveform gen ' + (meta.wf ? 'on' : 'off');
 }
@@ -567,6 +819,13 @@ function metaText(){
 function applyMeta(m){
   const changed = (m.channels || []).length !== chans.length;
   meta = m;
+  /* The server owns the two window numbers - it is what keeps (and re-primes) the
+     samples - so take them from the meta line unless the slider has been touched
+     already, and never let the window exceed the seconds being kept. */
+  if (m.keep_s > 0) KEEP_S = m.keep_s;
+  if (m.window_s > 0 && !viewTouched) viewSec = m.window_s;
+  viewSec = Math.max(MIN_VIEW_S, Math.min(viewSec, keepSeconds()));
+  syncView();
   if (changed) buildSeries(); else renderLegend();
   el('meta').textContent = metaText();
   dirty = true;
@@ -591,6 +850,23 @@ function applyData(m){
   dirty = true;
 }
 
+/* A closed event, parsed out of the M7's log lines: the window it claimed (in
+   sample indices), its width, the baseline it froze, the peak it reported on top
+   of that baseline and the verdict.  Drawing these over the traces is what makes
+   a decision auditable - a pulse buried in noise or two pulses merged into one
+   window cannot be judged from the trace alone. */
+function applyEvent(ev){
+  events.push(ev);
+  if (events.length > EV_KEEP) events.splice(0, events.length - EV_KEEP);
+  dirty = true;
+}
+
+/* Every decision still held, replayed to a browser that just connected. */
+function applyEvents(list){
+  events = (list || []).slice(-EV_KEEP);
+  dirty = true;
+}
+
 function addPoint(s, i, v){
   if (s.first === null) s.first = i;
   s.vals.push(v);
@@ -604,7 +880,7 @@ function trimAll(){
 }
 
 function trim(s){
-  const extra = s.vals.length - WINDOW;
+  const extra = s.vals.length - keepPoints();
   if (extra > 0){
     s.vals.splice(0, extra);
     s.first += extra * (meta.decim || 1);    // indices stay absolute
@@ -620,23 +896,45 @@ function addLog(line){
 }
 
 /* ---- drawing ---------------------------------------------------------- */
+/* The rolling window: the last `viewSec` seconds of the stream, right-aligned on the
+   newest sample.  The scale is fixed in *time*, so the traces scroll left at the rate
+   the samples arrive and the pane always holds the same number of points - that is
+   what keeps events from piling up in it.  Two consequences worth knowing:
+
+     * before a full window has arrived the pane shows what there is and the scale
+       grows with it (clamped at t = 0, so the times never go negative);
+     * only the points inside the window are scanned for Y - auto Y fits what is on
+       screen instead of a peak that has already scrolled out of it. */
 function visible(){
-  const d = meta.decim || 1;
-  let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity;
+  const d = meta.decim || 1, sr = meta.sample_rate || 10000;
   const all = (showGen ? [gen] : []).concat(chans);
+  let x1 = -Infinity;
   all.forEach((s) => {
     if (!s || s.first === null || !s.vals.length) return;
     const last = s.first + (s.vals.length - 1) * d;
-    if (s.first < x0) x0 = s.first;
     if (last > x1) x1 = last;
-    for (let k = 0; k < s.vals.length; k++){
-      const v = s.vals[k];
-      if (v < y0) y0 = v;
-      if (v > y1) y1 = v;
+  });
+  if (x1 === -Infinity) return null;
+  let x0 = x1 - viewSec * sr;
+  if (x0 < 0) x0 = 0;
+
+  let y0 = Infinity, y1 = -Infinity;
+  all.forEach((s) => {
+    const pts = traceIn(s, x0, x1);
+    for (let k = 0; k < pts.length; k++){
+      if (pts[k].v < y0) y0 = pts[k].v;
+      if (pts[k].v > y1) y1 = pts[k].v;
     }
   });
-  if (x0 === Infinity || y0 === Infinity) return null;
-  if (autoY || frozen === null){
+  if (y0 === Infinity) return null;          // nothing of the window is plotted
+  if (fullScale){
+    // Pin the axis to the ADC's own full scale.  The traces are what the AD7606
+    // reports, so only a real input that spans the strap fills the pane - the
+    // DAC loopback always stops at its clamp (3.1 V), i.e. 10166 counts at
+    // +/-10 V and 20333 at +/-5 V.  Auto Y would zoom onto that and hide how
+    // much of the scale is left.
+    y0 = -ADC_FULL_SCALE; y1 = ADC_FULL_SCALE;
+  } else if (autoY || frozen === null){
     const pad = Math.max((y1 - y0) * 0.08, 8);
     y0 -= pad; y1 += pad;
     frozen = { y0: y0, y1: y1 };
@@ -648,9 +946,24 @@ function visible(){
   return { x0: x0, x1: x1, y0: y0, y1: y1 };
 }
 
+/* The time gridlines: the first step in the 1-2-5 series that puts at most ten
+   lines across the window, in sample indices.  A 1 s window gets 0.1 s, an 8 s
+   window 1 s - so the labels stay readable at any window length (they are drawn
+   every stepS seconds, i.e. the pane never carries more than eleven of them). */
+const TICK_STEPS = [0.01, 0.02, 0.05, 0.1, 0.2, 0.25, 0.5, 1, 2, 5, 10];
+function xTicks(view){
+  const sr = meta.sample_rate || 10000;
+  const spanS = (view.x1 - view.x0) / sr;
+  let stepS = TICK_STEPS[TICK_STEPS.length - 1];
+  for (let k = 0; k < TICK_STEPS.length; k++){
+    if (spanS / TICK_STEPS[k] <= 10){ stepS = TICK_STEPS[k]; break; }
+  }
+  return { step: stepS * sr, stepS: stepS, dec: stepS < 0.1 ? 3 : 2 };
+}
+
 function draw(){
   const w = cv.width, h = cv.height;
-  const ml = 78, mr = 16, mt = 26, mb = 36;
+  const ml = ML, mr = MR, mt = MT, mb = MB;
   const pw = w - ml - mr, ph = h - mt - mb;
   g.clearRect(0, 0, w, h);
   g.fillStyle = '#fff'; g.fillRect(0, 0, w, h);
@@ -666,43 +979,306 @@ function draw(){
 
   g.strokeStyle = '#ececec'; g.lineWidth = 1;
   g.fillStyle = '#666'; g.textAlign = 'right'; g.textBaseline = 'middle';
-  for (let k = 0; k <= 5; k++){
-    const v = view.y0 + (view.y1 - view.y0) * k / 5;
+  const ndiv = (view.y1 - view.y0 === 2 * ADC_FULL_SCALE) ? 8 : 5;
+  for (let k = 0; k <= ndiv; k++){
+    const v = view.y0 + (view.y1 - view.y0) * k / ndiv;
     const y = Math.round(Y(v)) + 0.5;
     g.beginPath(); g.moveTo(ml, y); g.lineTo(ml + pw, y); g.stroke();
     g.fillText(v.toFixed(0), ml - 6, y);
   }
 
-  /* One vertical line per second of captured time. */
-  const sr = meta.sample_rate || 1, d = meta.decim || 1;
-  const pps = Math.max(1, sr / d);
-  const spanS = (view.x1 - view.x0) / pps;
-  const step = pps * (spanS < 1.6 ? 0.25 : spanS < 3.2 ? 0.5 : 1);
+  /* A vertical line every step of captured time (see xTicks). */
+  const sr = meta.sample_rate || 10000, d = meta.decim || 1;
+  const tk = xTicks(view);
   g.textAlign = 'center'; g.textBaseline = 'top';
-  for (let i = Math.ceil(view.x0 / step) * step; i <= view.x1; i += step){
+  for (let n = Math.ceil(view.x0 / tk.step); n * tk.step <= view.x1; n++){
+    const i = n * tk.step;
     const x = Math.round(X(i)) + 0.5;
     g.beginPath(); g.moveTo(x, mt); g.lineTo(x, mt + ph); g.stroke();
-    const t = i / sr;
-    g.fillText(t < 10 ? t.toFixed(2) + ' s' : t.toFixed(1) + ' s', x, mt + ph + 6);
+    g.fillText((i / sr).toFixed(tk.dec) + ' s', x, mt + ph + 6);
   }
+
+  /* The detector's decision goes under the traces, its tags above them. */
+  const tags = [];
+  if (showEvents) drawEvents(view, X, Y, tags);
 
   const order = (showGen ? [gen] : []).concat(chans);
   order.forEach((s) => {
     if (!s || s.first === null || s.vals.length < 2) return;
+    /* Only the points inside the window: the buffer holds keepPoints() of them, so
+       drawing all of it would draw (and join) points that are not shown. */
+    const k0 = Math.max(0, Math.ceil((view.x0 - s.first) / d));
+    const k1 = Math.min(s.vals.length - 1, Math.floor((view.x1 - s.first) / d));
+    if (k1 - k0 < 1) return;
     g.strokeStyle = s.color;
     g.lineWidth = s.dashed ? 1.5 : 1.2;
     g.setLineDash(s.dashed ? [6, 4] : []);
     g.beginPath();
-    for (let k = 0; k < s.vals.length; k++){
+    for (let k = k0; k <= k1; k++){
       const x = X(s.first + k * d), y = Y(s.vals[k]);
-      if (k) g.lineTo(x, y); else g.moveTo(x, y);
+      if (k > k0) g.lineTo(x, y); else g.moveTo(x, y);
     }
     g.stroke();
     g.setLineDash([]);
   });
 
+  if (tags.length) drawEventTags(tags);
+
   g.strokeStyle = '#bbb';
   g.strokeRect(ml + 0.5, mt + 0.5, pw, ph);
+}
+
+/* ---- judging a window against the trace -------------------------------- */
+/* The log's numbers are measured on EVERY raw sample; the trace carries only every
+   DECIM-th one.  A window can therefore claim a peak the trace never reaches, or
+   cover two pulses without saying so.  Neither is visible in the log lines, and
+   neither is necessarily wrong:
+     * a dip is *meant* to fuse two pulses - the window closes only after
+       DET_END_DEBOUNCE = 2 consecutive samples below base + k_off*sigma, so a
+       brief dip between two peaks cannot end it.  The overlay reports the dip
+       instead of calling the merge a mistake;
+     * an impulse is a sample the detector is right to take, but it masks the
+       height of the pulse underneath it, which is all a reader of max= needs.
+   Both are reported *next to* the detector's own numbers, as what the trace
+   supports, never in place of them.  Only these two checks are shipped: an "area
+   over width too high, so an impulse narrowed it" test was measured over the
+   simulator and cannot separate the two - a clamp-limited pulse and an
+   impulse-widened one overlap completely on that ratio. */
+
+function seriesFor(ch){
+  for (let k = 0; k < chans.length; k++) if (chans[k].label === 'ch' + ch) return chans[k];
+  return null;
+}
+
+/* The plotted samples of `s` inside [i0, i1] as { i, v } - one point per DECIM-th raw
+   sample, i.e. the points the trace is drawn from. */
+function traceIn(s, i0, i1){
+  const out = [], d = meta.decim || 1;
+  if (s === null || s.first === null || !s.vals.length) return out;
+  const k0 = Math.max(0, Math.ceil((i0 - s.first) / d));
+  const k1 = Math.min(s.vals.length - 1, Math.floor((i1 - s.first) / d));
+  for (let k = k0; k <= k1; k++) out.push({ i: s.first + k * d, v: s.vals[k] });
+  return out;
+}
+
+/* What the trace says about one window.  Cached on the event: the answer changes
+   only while the window's own samples are still arriving. */
+function judge(ev){
+  if (ev.q && (ev.qdone || ev.qcov === newest)) return ev.q;
+  const d = meta.decim || 1;
+  const q = { ch: null, lobes: 0, dip: null, dipIdx: null, tops: [],
+              support: null, why: null, apexIdx: null, apexV: null };
+  const s = seriesFor(ev.channel);
+  const pts = (s === null) ? [] : traceIn(s, ev.start, ev.end);
+
+  if (pts.length){
+    q.ch = s.label;
+    let top = -Infinity, kTop = 0;
+    for (let k = 0; k < pts.length; k++) if (pts[k].v > top){ top = pts[k].v; kTop = k; }
+
+    if (ev.max > 0 && top > ev.base){       // a window that claims no peak has none
+      /* A peak is an excursion the trace *holds* above half of the window's own height
+         - taken from the trace, so a max an impulse inflated cannot hide the peak
+         underneath it - and it is over once the trace has come back down to
+         EV_DIP_DROP of that peak's own height and stayed there for EV_DIP_PTS plotted
+         points (which are DECIM raw samples apart, so no single sample fakes it).
+         Both sides of the pair need the run: one point of dither above the line cannot
+         open a peak, and one below it cannot close one.  Measuring the come-down
+         against the peak's own height, and leaving a gap between the two levels, is
+         what keeps a slow, noisy edge in one piece - walking down through half height
+         the trace crosses that level again and again, but it never climbs back to
+         where a new peak has to start. */
+      const hi = ev.base + 0.5 * (top - ev.base);
+      let inLobe = false, up = 0, low = 0, lowMin = Infinity, lowIdx = null;
+      for (let k = 0; k < pts.length; k++){
+        const v = pts[k].v;
+        const t = q.tops.length ? q.tops[q.tops.length - 1] : null;
+        if (!inLobe && v >= hi){                  // an excursion, if the trace holds it
+          if (++up >= EV_DIP_PTS){
+            inLobe = true; q.lobes++; q.tops.push({ i: pts[k].i, v: v });
+            up = 0; low = 0; lowMin = Infinity;
+          }
+        } else if (!inLobe){
+          up = 0;
+        } else if (v >= ev.base + EV_DIP_DROP * (t.v - ev.base)){  // still that peak
+          if (v > t.v){ t.v = v; t.i = pts[k].i; }
+          low = 0; lowMin = Infinity;
+        } else {                                  // under this peak's own drop level
+          low++;
+          if (v < lowMin){ lowMin = v; lowIdx = pts[k].i; }
+          if (low >= EV_DIP_PTS){                 // down and stayed: peak over
+            inLobe = false; low = 0;
+            if (q.dip === null || lowMin - ev.base < q.dip){
+              q.dip = lowMin - ev.base; q.dipIdx = lowIdx;
+            }
+          }
+        }
+      }
+    }
+
+    /* Was the reported max ever *drawn* as a peak?  Two ways it cannot be, and they
+       are worth different amounts of trust:
+         'trace' - no plotted sample comes near it: the impulse fell between two DECIM
+                   samples, so nothing on the canvas reaches the line the verdict
+                   colour drew.  The trace disproves the max;
+         'lone'  - the one sample that does reach it stands alone, with the shape of the
+                   pulse far below it on both sides.  A real apex is broad: within
+                   EV_NEAR_SPAN of the window of itself the trace is still most of its
+                   own height, and scaling that band with the window is what keeps this
+                   right for wide pulses.  A pulse sharper than the trace can draw looks
+                   the same, so this one says "look here", not "impulse". */
+    const span = (ev.end - ev.start) / d;
+    if (span >= EV_MAX_PTS && ev.max > 0){        // a max of 0 claims nothing
+      if ((ev.base + ev.max) - top > EV_MAX_MISS * ev.max){
+        q.support = top - ev.base; q.why = 'trace';      // simply not drawn
+      } else if (q.lobes < EV_LOBES && span >= EV_SPIKE_PTS){
+        /* Only for a window the trace calls one peak: with two lobes the apex belongs
+           to a peak the detector did catch, and the dip note already says so. */
+        const near = Math.max(1, Math.round(EV_NEAR_SPAN * span));
+        let nv = -Infinity;
+        const j0 = Math.max(0, kTop - near), j1 = Math.min(pts.length - 1, kTop + near);
+        for (let j = j0; j <= j1; j++) if (j !== kTop && pts[j].v > nv) nv = pts[j].v;
+        if (nv > -Infinity && top - nv > 0.5 * (top - ev.base)){
+          q.support = nv - ev.base; q.why = 'lone';
+          q.apexIdx = pts[kTop].i; q.apexV = top;
+        }
+      }
+    }
+  }
+
+  ev.q = q; ev.qcov = newest;
+  if (newest !== null && newest > ev.end){         // the whole window is in hand
+    ev.qdone = true;
+    if (q.ch !== null){                            // tally it once, for the stats line
+      flagTally.judged++;
+      if (q.lobes >= EV_LOBES) flagTally.dip++;
+      if (q.support !== null) flagTally.max++;
+    }
+  }
+  return q;
+}
+
+/* The M7's decision, drawn where it was taken: the window it claimed (with the
+   width in samples it reports), the baseline it froze for that window, and the
+   peak it reported on top of that baseline.  That is enough to tell a real
+   detection from a lucky one when the pulse is buried in noise, or to see two
+   pulses swallowed by a single window - neither is visible in the trace alone.
+
+   In the default LINKED mode (SORTER_METRIC_MODE = 1) the window *is* the detected
+   width; in per-channel mode a channel can be narrower than the group window, and
+   the tag then spells out both.
+
+   Two things the lines cannot show are read off the trace and drawn in their own
+   colours: a dip between two peaks inside one window (EV_DIP) and a max the window's
+   own samples do not support (EV_SUPPORT).  See judge(). */
+function drawEvents(view, X, Y, tags){
+  const top = MT, bot = cv.height - MB;
+  events.forEach((ev) => {
+    if (ev.end < view.x0 || ev.start > view.x1) return;     // scrolled away
+    const col = ev.valid ? EV_OK : EV_BAD;
+    const x0 = X(ev.start), x1 = Math.max(X(ev.end), x0 + 1);
+    /* Reference lines sit on a half pixel (like the gridlines) so they stay 1 px
+       and crisp instead of smearing over two rows at fractional positions. */
+    const e0 = Math.round(x0) + 0.5, e1 = Math.round(x1) + 0.5;
+
+    g.fillStyle = ev.valid ? EV_FILL_OK : EV_FILL_BAD;
+    g.fillRect(x0, top, x1 - x0, bot - top);
+    g.strokeStyle = col; g.lineWidth = 1; g.setLineDash([3, 3]);
+    [e0, e1].forEach((x) => {                  // the window's own edges
+      g.beginPath(); g.moveTo(x, top); g.lineTo(x, bot); g.stroke();
+    });
+
+    const yb = Math.round(Y(ev.base)) + 0.5;
+    const ym = Math.round(Y(ev.base + ev.max)) + 0.5;
+    g.strokeStyle = EV_BASE; g.setLineDash([4, 3]);         // frozen baseline
+    g.beginPath(); g.moveTo(e0, yb); g.lineTo(e1, yb); g.stroke();
+    g.strokeStyle = col; g.setLineDash([6, 3]);             // the peak it reported
+    g.beginPath(); g.moveTo(e0, ym); g.lineTo(e1, ym); g.stroke();
+    g.setLineDash([]);
+
+    /* What the trace says the window does not: a dip between two peaks, and a max the
+       window's own samples never reach (or reach only at one lone point). */
+    const q = judge(ev);
+    if (q.lobes >= EV_LOBES){
+      const xd = Math.round(X(q.dipIdx)) + 0.5;
+      const yd = Math.round(Y(ev.base + q.dip)) + 0.5;
+      g.fillStyle = EV_DIP;                                // every peak it swallowed
+      q.tops.forEach((t) => {
+        g.fillRect(Math.round(X(t.i)) - 1, Math.round(Y(t.v)) - 1, 3, 3);
+      });
+      g.strokeStyle = EV_DIP; g.lineWidth = 2;             // .. and the dip between
+      g.beginPath(); g.moveTo(xd, yb); g.lineTo(xd, yd); g.stroke();
+      g.beginPath(); g.moveTo(xd - 3, yd); g.lineTo(xd + 3, yd); g.stroke();
+      g.lineWidth = 1;
+    }
+    if (q.support !== null){
+      /* Where the claim would sit if it matched what the window's own samples
+         support - always below the line the verdict colour drew. */
+      const ys = Math.round(Y(ev.base + q.support)) + 0.5;
+      g.strokeStyle = EV_SUPPORT; g.lineWidth = 1; g.setLineDash([1, 3]);
+      g.beginPath(); g.moveTo(e0, ys); g.lineTo(e1, ys); g.stroke();
+      g.setLineDash([]);
+      if (q.apexIdx !== null){                    // .. and the lone sample it stands on
+        g.fillStyle = EV_SUPPORT;
+        g.fillRect(Math.round(X(q.apexIdx)) - 1, Math.round(Y(q.apexV)) - 1, 3, 3);
+      }
+    }
+
+    const notes = [];
+    if (q.lobes >= EV_LOBES){
+      notes.push({ col: EV_DIP, text: '  ' + q.lobes + ' peaks  dip '
+                    + (q.dip > 0 ? '+' : '') + Math.round(q.dip) });
+    }
+    if (q.support !== null){
+      /* "!" is the hard one - nothing the trace drew reaches the max; "?" the softer
+         one - only a lone sample does.  Both are read off the trace, neither is proof. */
+      notes.push({ col: EV_SUPPORT, text: (q.why === 'trace' ? '  !max (' : '  ?max (')
+                    + q.why + ' ' + Math.round(q.support) + ')' });
+    }
+
+    tags.push({ x: x0 + 3, col: col, notes: notes,
+                text: '#' + ev.index + ' ch' + ev.channel + ' '
+                      + (ev.valid ? 'VALID' : 'rej ' + ev.reason_name)
+                      + '  w=' + ev.width_smp + 'smp  max=' + ev.max
+                      + '  base=' + ev.base
+                      + (ev.width_smp === (ev.end - ev.start) ? ''
+                         : '  (win ' + (ev.end - ev.start) + 'smp)') });
+  });
+}
+
+/* One tag per event, packed into a few rows across the top of the pane so that
+   neighbouring windows (the busy case: merged pulses) stay readable.  A tag is the
+   measured numbers in the verdict colour, plus the overlay's own findings after
+   them, each in the colour it was drawn in on the canvas. */
+function drawEventTags(tags){
+  g.font = 'bold 11px Segoe UI';
+  g.textAlign = 'left'; g.textBaseline = 'top';
+  const laneRight = [];
+  tags.sort((a, b) => a.x - b.x);
+  tags.forEach((t) => {
+    const notes = t.notes || [];
+    let textW = g.measureText(t.text).width;
+    notes.forEach((n) => { textW += g.measureText(n.text).width; });
+    const tw = textW + 10;
+    let lane = 0;
+    while (lane < EV_LANES - 1 && t.x < laneRight[lane] + 4) lane++;
+    laneRight[lane] = Math.max(laneRight[lane] || t.x, t.x + tw);
+    const y = MT + 4 + lane * 15;
+    g.fillStyle = 'rgba(255,255,255,0.9)';
+    g.fillRect(t.x, y, tw, 14);
+    g.strokeStyle = t.col; g.lineWidth = 1;
+    g.strokeRect(t.x + 0.5, y + 0.5, tw - 1, 13);
+    let x = t.x + 5;
+    g.fillStyle = t.col;
+    g.fillText(t.text, x, y + 2);
+    x += g.measureText(t.text).width;
+    notes.forEach((n) => {
+      g.fillStyle = n.col;
+      g.fillText(n.text, x, y + 2);
+      x += g.measureText(n.text).width;
+    });
+  });
+  g.font = '11px Segoe UI';
 }
 
 function statsText(){
@@ -715,8 +1291,28 @@ function statsText(){
        + '   received ' + received + ' points'
        + '   ' + rate.toFixed(0) + ' points/s = '
        + (rate * d / 1000).toFixed(2) + ' kSPS'
-       + '   trace holds ' + (gen ? gen.vals.length : 0) + ' points'
+       + '   trace holds ' + (gen ? gen.vals.length : 0) + ' points, '
+       + viewPoints() + ' in the ' + viewSec.toFixed(2) + ' s window'
+       + eventsText()
        + (paused ? '   [PAUSED]' : '');
+}
+
+/* How many decisions the page is holding, and how many of them were accepted. */
+function eventsText(){
+  if (!events.length) return '';
+  let ok = 0;
+  for (let k = 0; k < events.length; k++) if (events[k].valid) ok++;
+  return '   windows ' + events.length + ' (' + ok + ' accepted)' + flagsText();
+}
+
+/* What the trace said about the windows it was asked to judge - a running count, so
+   the numbers also cover windows that have since scrolled out of the trace.  "max?"
+   is a reported peak no plotted sample came near, or one only a single point reached:
+   the trace cannot prove an impulse did it, but it is where to look. */
+function flagsText(){
+  if (!flagTally.judged) return '';
+  return '   read back ' + flagTally.judged + ' windows: '
+       + flagTally.dip + ' two-peak, ' + flagTally.max + ' max?';
 }
 
 /* ---- live wiring ------------------------------------------------------ */
@@ -724,19 +1320,36 @@ const es = new EventSource('/stream');
 es.onmessage = (ev) => {
   let m;
   try { m = JSON.parse(ev.data); } catch (e) { return; }
-  if (m.kind === 'meta')      applyMeta(m);
-  else if (m.kind === 'data') applyData(m);
-  else if (m.kind === 'log')  addLog(m.line);
+  if (m.kind === 'meta')        applyMeta(m);
+  else if (m.kind === 'data')   applyData(m);
+  else if (m.kind === 'log')    addLog(m.line);
+  else if (m.kind === 'event')  applyEvent(m);
+  else if (m.kind === 'events') applyEvents(m.list);
 };
 es.onopen  = () => { el('meta').textContent = metaText(); };
 es.onerror = () => { el('meta').textContent = 'stream lost - reconnecting...'; };
 
 el('autoy').onchange   = (e) => { autoY  = e.target.checked; dirty = true; };
+el('fullscale').onchange = (e) => { fullScale = e.target.checked; dirty = true; };
 el('showgen').onchange = (e) => { showGen = e.target.checked; dirty = true; };
+el('showevents').onchange = (e) => {
+  showEvents = e.target.checked; renderLegend(); dirty = true;
+};
 el('pause').onchange   = (e) => { paused = e.target.checked; dirty = true; };
 el('clear').onchange   = (e) => {
   if (e.target.checked){ buildSeries(); el('log').innerHTML = ''; }
   e.target.checked = false;
+};
+/* The rolling window is the page's own knob: widening it redraws from the samples
+   already kept (keepPoints), narrowing it tightens what is on screen - no waiting
+   for the stream either way, and the events in view scale with the window. */
+el('view').oninput = (e) => {
+  viewTouched = true;
+  const v = +e.target.value;
+  viewSec = Math.max(MIN_VIEW_S, Math.min(keepSeconds(), v > 0 ? v : VIEW_S));
+  syncView();
+  el('meta').textContent = metaText();
+  dirty = true;
 };
 
 function frame(){
@@ -749,6 +1362,7 @@ function frame(){
   requestAnimationFrame(frame);
 }
 buildSeries();
+syncView();
 requestAnimationFrame(frame);
 </script>
 </body>
@@ -756,10 +1370,16 @@ requestAnimationFrame(frame);
 """
 
 
-def page_html(window, range_v):
-    """The page, with its three constants filled in."""
+def page_html(window_s, keep_s, range_v):
+    """The page, with its own constants filled in.
+
+    `window_s` is the rolling window the page opens with and `keep_s` the seconds it
+    keeps per trace (the slider's ceiling), both in seconds: the page holds time, not
+    a point count, so the pane looks the same whatever the board's stream rate is.
+    """
     return (PAGE
-            .replace('__WINDOW__', str(window))
+            .replace('__VIEW__', '%g' % window_s)
+            .replace('__HISTORY__', '%g' % keep_s)
             .replace('__COLORS__', json.dumps(TRACE_COLORS))
             .replace('__RANGE__', '%g' % range_v))
 
@@ -782,7 +1402,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(404, 'not found')
 
     def send_page(self):
-        body = page_html(self.server.state.window, self.server.range_v).encode('utf-8')
+        body = page_html(self.server.state.window_sec, self.server.state.keep_sec,
+                         self.server.range_v).encode('utf-8')
         self.send_response(200)
         self.send_header('Content-Type', 'text/html; charset=utf-8')
         self.send_header('Content-Length', str(len(body)))
@@ -828,7 +1449,7 @@ def main(argv=None):
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog='examples:\n'
                '  py -3 test/live_plot.py --sim\n'
-               '  py -3 test/live_plot.py --sim --window 2000 --http-port 9000\n'
+               '  py -3 test/live_plot.py --sim --window 2 --http-port 9000\n'
                '  py -3 test/live_plot.py --port COM7')
 
     src = p.add_argument_group('source')
@@ -848,8 +1469,13 @@ def main(argv=None):
                       help='simulated and plotted channel count (default %(default)s)')
     view.add_argument('--range', dest='range_v', type=float, default=10.0,
                       help='AD7606 full-scale input in volts (default %(default)s)')
-    view.add_argument('--window', type=int, default=4000,
-                      help='points kept in the rolling window (default %(default)s)')
+    view.add_argument('--window', type=float, default=VIEW_SEC,
+                      help='rolling window the page opens with, in seconds - the page '
+                           'has a slider for it (default %(default)s)')
+    view.add_argument('--history', type=float, default=HISTORY_SEC,
+                      help='seconds kept per trace, i.e. how far the page may widen '
+                           'its window without waiting for new samples (default '
+                           '%%(default)s, capped at %g s)' % MAX_KEEP_SEC)
     view.add_argument('--host', default='127.0.0.1', help='bind address')
     view.add_argument('--http-port', type=int, default=8000,
                       help='page/SSE port (default %(default)s)')
@@ -862,7 +1488,15 @@ def main(argv=None):
     if not args.sim and not args.port:
         p.error('give --port COMx for the board, or --sim to run without one')
 
-    state = StreamState(window=max(args.window, 2 * POINTS))
+    # The window is measured in seconds, so an old point count ("--window 2000") would
+    # ask for a buffer no page could draw: keep the two sensible and in order.
+    view_sec = min(max(args.window, MIN_VIEW_SEC), MAX_KEEP_SEC)
+    keep_sec = min(max(args.history, view_sec), MAX_KEEP_SEC)
+    if max(args.history, args.window) > MAX_KEEP_SEC:
+        print('live_plot: window/history above %g s are capped there - the sample '
+              'buffers are sized for that much' % MAX_KEEP_SEC)
+    state = StreamState(window=view_points(keep_sec), window_sec=view_sec,
+                        keep_sec=keep_sec)
     if args.sim:
         source = SimSource(state, args.range_v, speed=args.sim_speed,
                            channels=max(args.channels, 1), seed=args.sim_seed)
@@ -881,6 +1515,9 @@ def main(argv=None):
                              args.http_port)
     print('live_plot: source = %s' % ('simulator (signal_model.py)' if args.sim
                                       else args.port))
+    print('live_plot: rolling window %.2f s, %d points kept (%.1f s) - the page\'s '
+          'slider goes down to %.1f s'
+          % (state.window_sec, state.window, state.keep_sec, MIN_VIEW_SEC))
     print('live_plot: open %s   (Ctrl+C to stop)' % url)
     if not args.no_open:
         webbrowser.open(url)
