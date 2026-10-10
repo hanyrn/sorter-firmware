@@ -1131,24 +1131,27 @@ baseline**, so peaks are positive excursions — exactly what the detector's
   test\test_bench_detect.exe --ladder --ladder-width 100 --ladder-step 10
   ```
 
-  * at 600 samples the first rung the detector takes is **100 counts** (60 and 20 stay
-    silent), and the edge *moves with the staircase*: refined with `--ladder-step 10` from
-    20 it lands at 70 (60 silent), started at 40 it lands at 80 (70 silent). So "the floor
-    at 60 ms" is a **band** of 60-100 counts, not a number - a borderline apex is decided
-    by the dither that lands on it - and the table above rounds that column up to 80,
-    inside the band;
-  * walking the width reproduces the table's shape: 40 samples (4 ms) takes **nothing** at
-    any height, 100 (10 ms) takes 140, 200 (20 ms) takes 100 - and the run says "no claim
-    on the pinnacle" instead of failing when the width is one the rise test can never
-    accept;
-  * the ladder has one caveat of its own, and it is the tracker again: a slot has to be
-    long against `1/DET_BASELINE_ALPHA` (1000 samples) or the baseline never gets back to
-    the true level between two rungs and every apex measures short. A 1200-sample rung at
-    12 rungs/cycle leaves 466 samples of baseline and reads a floor of 380-420 counts; the
-    same rungs at `--ladder-count 4` (5000-sample slots) read 60-100, which is the table's
-    own 150-1200 column. `--ladder-count` is how you give the tracker the time a wide
-    rung needs; a rung wider than its own slot cannot be drawn at all, and the run says so
-    (and fails) rather than reporting a floor it did not measure.
+  * at 600 samples the first rung the detector takes is **60 counts** (20 stays silent),
+    and the edge *moves with the dither*: refined with `--ladder-step 10` from 20 it lands
+    at 70 (60 silent), and started at 40 it lands at 70 again (60 silent). So "the floor
+    at 60 ms" is a **band**, not a number - the 60-count rung's reported max (84) only just
+    clears `DET_MIN_MAX_VALUE` (80), so it comes and goes with the noise on it - and the
+    table above files this width under its 150-1200 cell (70-100), just above the band;
+  * walking the width with the same staircase brackets the table's columns from the step
+    side: 40 samples (4 ms) takes **nothing** at any height (10 of the 12 rungs rejected),
+    60 (6 ms) between 180 and 220 counts, 80 (8 ms) between 100 and 140, 100-200 (10-20 ms)
+    between 60 and 100, 300-1200 (30-120 ms) between 20 and 60 (rung #2, 60 counts, taken).
+    The run says "no claim on the pinnacle" instead of failing when the width is one the
+    rise test can never accept;
+  * the table stays the finer measurement - one raised cosine at a time on a fresh quiet
+    period, `--peaks` - because the ladder can only answer in `--ladder-step` (40-count)
+    jumps and its bottom rung flips a step with the slot geometry: the same 600-sample rung
+    is taken at 12 rungs per cycle and left alone at `--ladder-count 6`. `--ladder-count`
+    is what a *wide* rung needs to be drawn at all (a 1200-sample rung at 12 rungs/cycle
+    leaves 466 samples of baseline and still reads between 20 and 60 counts; a 2400-sample
+    rung cannot be drawn there and draws at `--ladder-count 4`, 5000-sample slots, reading
+    between 60 and 100 - the table's own 240 ms cell); a rung wider than its own slot fails
+    with that reason rather than reporting a floor it did not measure.
 
   At the widest front end modelled (`--frontend 4`, where the DAC/ADC path smears an
   impulse over four samples) a 7-tap median can no longer reach the spike. Nothing is

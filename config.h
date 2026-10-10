@@ -757,23 +757,25 @@ static const uint8_t AD7606_BUSY1_PIN  = A5;
 // reference is subtracted (the tracker partly follows a 600-sample rung), which is why
 // the edge moves with the seed and not with the trigger.
 //
-// Walking the width with the shipped staircase (--ladder-width) reproduces the table's
-// shape: 40 samples (4 ms) takes *nothing*, not one rung of twelve, whatever the height
-// (the rise test's own corner - and the run says "no claim on the pinnacle" instead of
-// failing); 100 (10 ms) takes 60; 200 (20 ms) takes 70; 600 (60 ms) takes 70; 1200
-// (120 ms) takes 100 with the shipped 12-rung density and 2400 (240 ms) takes 80 with
-// enough baseline around it (see below).  A width the ladder cannot draw at all (2400
-// samples into a 1666-sample slot) fails with the reason rather than reporting a floor it
-// did not measure.
+// Walking the width with the shipped staircase (--ladder-width, 12 rungs 20..460, step 40)
+// brackets the table above from the step side: 40 samples (4 ms) takes *nothing* - 10 of
+// the 12 rungs rejected, and the run says "no claim on the pinnacle" instead of failing,
+// because no apex can show a 20-sample edge there; 60 (6 ms) between 180 and 220 counts;
+// 80 (8 ms) between 100 and 140; 100..200 (10..20 ms) between 60 and 100; 300..1200
+// (30..120 ms) between 20 and 60, i.e. rung #2 (60 counts) taken.  A width the ladder
+// cannot draw at all (2400 samples into a 1666-sample slot) fails with that reason rather
+// than reporting a floor it did not measure.
 //
-// The 1200-sample (120 ms) column needs one more thing, and it is the ladder's own
-// instrument physics rather than the detector's: a slot has to be long against the
-// baseline tracker's time constant (1/DET_BASELINE_ALPHA = 1000 samples) or the tracker
-// never gets back to the true level between two rungs and every apex measures short. At
-// 12 rungs per cycle a 1200-sample rung leaves 466 samples of baseline between rungs and
-// the floor reads 90..100 counts; the same rungs at --ladder-count 6 (3333-sample slots)
-// read 40..60, which is the table's own 150-1200 column.  So --ladder-count is how you
-// give the tracker the time a wide rung needs.
+// The ladder answers in --ladder-step jumps (40 counts) and its bottom rung flips a step
+// with the slot geometry, so read the *band* and not the number: the same 600-sample rung
+// is taken at the shipped 12 rungs per cycle and left alone at --ladder-count 6.  A slot
+// long against the baseline tracker's time constant (1/DET_BASELINE_ALPHA = 1000 samples)
+// is what a *wide* rung needs, not a lower floor: at 12 rungs/cycle a 1200-sample rung
+// leaves 466 samples of baseline and still reads between 20 and 60 counts (11 of 12
+// VALID), while a 2400-sample rung cannot be drawn there at all and draws at
+// --ladder-count 4 (5000-sample slots), reading between 60 and 100 - the table's own
+// 240 ms cell.  So --ladder-count buys a wide rung the room to be drawn, and the table
+// stays the finer measurement of the floor (one raised cosine, fresh quiet period).
 #define SIGNALGEN_LADDER       0       // 0 = the random train, 1 = the floor ladder
 #define SIGNALGEN_LADDER_WIDTH 600u    // samples (60 ms): the width every rung has,
                                        // inside the band the table above covers
