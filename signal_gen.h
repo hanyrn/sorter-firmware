@@ -7,9 +7,12 @@
 // hardware-in-the-loop test without any external signal source.
 //
 // The waveform itself - a train of randomly parameterised pulses on a DC baseline
-// with dither - lives in signal_model.h (Arduino-free, unit-tested, mirrored in
-// Python).  This class is only the DAC side of it: it owns the model and writes
-// each generated code to A12/A13 with analogWrite().
+// with dither, or, with SIGNALGEN_LADDER = 1, the *floor ladder* instead: isolated
+// pulses of one width whose apexes step up from below the detector's floor, which is
+// the one pattern that lets the live plot show small, near-baseline peaks (see the
+// SIGNALGEN_LADDER_* block in config.h) - lives in signal_model.h (Arduino-free,
+// unit-tested, mirrored in Python).  This class is only the DAC side of it: it owns
+// the model and writes each generated code to A12/A13 with analogWrite().
 //
 // tick() is called once per acquisition iteration, i.e. the generator is
 // *sample-locked* to the ADC: one DAC update per conversion, with no timer and no

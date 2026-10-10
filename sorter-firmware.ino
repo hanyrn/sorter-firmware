@@ -88,13 +88,25 @@ static EventDetector::Config makeDetectorConfig() {
     c.k_off             = DET_K_OFF;
     c.k_gate            = DET_K_GATE;
     c.sigma_floor       = DET_SIGMA_FLOOR;
-    c.warmup_samples    = DET_WARMUP_SAMPLES;
+    // The quiet period and its seed points, and the ceiling on the reference-update
+    // gate: this is how the baseline/noise are established and kept stable (see
+    // config.h and EventDetector::updateBaseline).
+    c.quiet_samples     = DET_QUIET_SAMPLES;
+    c.quiet_seed_points = DET_QUIET_SEED_POINTS;
+    c.gate_max          = DET_GATE_MAX;
+    // The rise test and the end of an event (event_detector.h, state RISING/EVENT).
+    c.min_rise_samples  = DET_MIN_RISE_SAMPLES;
+    c.dip_tolerance     = DET_DIP_TOLERANCE;
     c.end_debounce      = DET_END_DEBOUNCE;
+    // The bounds a closed excursion has to satisfy to count as a peak.
     c.min_max_value     = DET_MIN_MAX_VALUE;
     c.min_width_samples = DET_MIN_WIDTH_SAMPLES;
     c.max_width_samples = DET_MAX_WIDTH_SAMPLES;
     c.min_area          = DET_MIN_AREA;
     c.max_slope         = DET_MAX_SLOPE;
+    // Input stage: drops lone noise spikes so they can neither open/close an event
+    // nor be reported as its maximum (see ImpulseFilter in event_detector.h).
+    c.impulse_filter_taps = DET_IMPULSE_FILTER_TAPS;
     return c;
 }
 
@@ -293,8 +305,9 @@ static void printBundle(const EventRecord& rec) {
 static bool     g_streamOn    = false;
 static uint32_t g_streamLines = 0;      // points printed since streaming came on
 
-// Metadata line: the host learns the decimation (=> the sample rate) and which
-// channels the columns carry from here instead of hard-coding config.h.
+// Metadata line: the host learns the decimation (=> the sample rate), which channels
+// the columns carry and the width floor the detector judges with from here instead of
+// hard-coding config.h.
 static void printStreamInfo() {
     Serial.print("STREAM ");
     Serial.print(g_streamOn ? "on" : "off");
@@ -316,6 +329,13 @@ static void printStreamInfo() {
 #endif
     Serial.print(" points=");
     Serial.print((unsigned)SORTER_STREAM_POINTS);
+    // The judged width floor, in samples at SORTER_SAMPLE_RATE_HZ: the shortest event
+    // the detector accepts (DET_MIN_WIDTH_SAMPLES, judged against the event's *duration* -
+    // see the note in config.h).  The host draws it as a band on every event window, so an
+    // event too short to accept can be *seen* to be too short and not only reported as
+    // such.  Read out of the same config the detector was given.
+    Serial.print(" minw=");
+    Serial.print((unsigned)makeDetectorConfig().min_width_samples);
     Serial.println();
     g_streamLines = 0;
 }

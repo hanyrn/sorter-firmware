@@ -68,13 +68,31 @@ EventDetector::Config detectorConfig() {
     c.k_off             = 2.0f;
     c.k_gate            = 3.0f;
     c.sigma_floor       = 1;
-    c.warmup_samples    = 3000;
-    c.end_debounce      = 2;
-    c.min_max_value     = 80;
-    c.min_width_samples = 3;
-    c.max_width_samples = 200000;
-    c.min_area          = 0;
-    c.max_slope         = 100.0f;
+    c.quiet_samples     = 3000;    // DET_QUIET_SAMPLES
+    c.quiet_seed_points = 128;     // DET_QUIET_SEED_POINTS
+    c.gate_max          = 160;     // DET_GATE_MAX
+    c.end_debounce      = 2;       // DET_END_DEBOUNCE
+    c.min_rise_samples  = 20;      // DET_MIN_RISE_SAMPLES (the rise test)
+    c.dip_tolerance     = 3;       // DET_DIP_TOLERANCE
+    // The scenarios here pin the window/group logic, so they state their own input
+    // conditioning instead of inheriting whatever the firmware ships.  It is the
+    // historical 3, not the shipped 7 (DET_IMPULSE_FILTER_TAPS): this signal's noise
+    // is a fresh gaussian draw of sigma 5 counts on every channel, so the 5*sigma
+    // start threshold (12-17 counts) sits far below min_max_value (80) and NO
+    // excursion that could pass the amplitude bound is ever near it.  A longer
+    // median lowers the sigma estimate further (measured: 3.5 -> 2.3 counts, i.e.
+    // the start threshold drops from ~17 to ~12 counts), and then a 13-count noise
+    // bump can start a rise candidate - which the rise test suppresses outright (it
+    // has to last min_rise_samples before it is an event at all), so the group
+    // bookkeeping these checks assert on is not perturbed by it.  The shipped filter
+    // is covered end to end by test/test_bench_detect.cpp instead, which sweeps it at
+    // every front-end width.
+    c.impulse_filter_taps = 3;
+    c.min_max_value     = 80;      // DET_MIN_MAX_VALUE
+    c.min_width_samples = 35;      // DET_MIN_WIDTH_SAMPLES (3.5 ms)
+    c.max_width_samples = 20000;   // DET_MAX_WIDTH_SAMPLES (fault guard)
+    c.min_area          = 0;       // DET_MIN_AREA
+    c.max_slope         = 100.0f;  // DET_MAX_SLOPE
     return c;
 }
 
@@ -174,15 +192,28 @@ static void testLinked() {
         CHECK(c0 && c1 && c8, "LINKED #%d: a channel record is missing", e);
         if (!c0 || !c1 || !c8) { continue; }
 
-        // One event, one width: every channel inherits the primary's width.
-        CHECK(c0->width_samples == b.width_samples, "LINKED #%d ch0: width %u != window %u",
-              e, (unsigned)c0->width_samples, (unsigned)b.width_samples);
-        CHECK(c8->width_samples == b.width_samples, "LINKED #%d ch8: width %u != window %u",
+        // One event, one width: every channel inherits the primary's judged width - and
+        // what the channel records carry is the event's DURATION: the primary's
+        // excursion widened for the pulse's own envelope
+        // (EventDetector::envelopeDuration).  The bundle keeps the WINDOW: the span the
+        // primary's excursion covered, which is what every channel was measured inside.
+        // Those are different quantities now, so what has to hold is the relationships
+        // below - never "the channel width equals the window".
+        CHECK(c0->width_samples == c8->width_samples &&
+              c1->width_samples == c8->width_samples,
+              "LINKED #%d: widths %u/%u/%u, expected one inherited width",
+              e, (unsigned)c0->width_samples, (unsigned)c1->width_samples,
+              (unsigned)c8->width_samples);
+        CHECK(c8->width_samples >= b.width_samples,
+              "LINKED #%d: judged width %u is shorter than the window %u - the envelope "
+              "correction may only widen",
               e, (unsigned)c8->width_samples, (unsigned)b.width_samples);
-        CHECK(c1->width_samples == b.width_samples, "LINKED #%d ch1: width %u != window %u",
-              e, (unsigned)c1->width_samples, (unsigned)b.width_samples);
-        CHECK(b.width_us == c8->width_us, "LINKED #%d: window %uus != ch8 %uus",
-              e, (unsigned)b.width_us, (unsigned)c8->width_us);
+        CHECK(b.width_samples > 0 &&
+              c8->width_us == (uint32_t)((uint64_t)b.width_us * c8->width_samples /
+                                         b.width_samples),
+              "LINKED #%d: %uus for %usmp does not match the window %uus/%usmp",
+              e, (unsigned)c8->width_us, (unsigned)c8->width_samples,
+              (unsigned)b.width_us, (unsigned)b.width_samples);
         CHECK(b.end_us == b.start_us + b.width_us, "LINKED #%d: window %u..%u",
               e, (unsigned)b.start_us, (unsigned)b.end_us);
 
@@ -265,8 +296,15 @@ static void testLinkedClip() {
           (int)c8->max_value);
     CHECK(c0->max_value < c8->max_value, "clip: ch0 (%d) not clipped below ch8 (%d)",
           (int)c0->max_value, (int)c8->max_value);
-    CHECK(c0->width_samples == b.width_samples, "clip: ch0 width %u != window %u",
-          (unsigned)c0->width_samples, (unsigned)b.width_samples);
+    // The clipped channel inherits the primary's judged width (the event's duration);
+    // its own numbers were cut off by the window, so only the *shape* bounds on them
+    // mean anything.  The window it was cut by is the primary's excursion.
+    CHECK(c0->width_samples == c8->width_samples,
+          "clip: ch0 width %u != ch8 width %u", (unsigned)c0->width_samples,
+          (unsigned)c8->width_samples);
+    CHECK(c8->width_samples >= b.width_samples,
+          "clip: judged width %u is shorter than the window %u",
+          (unsigned)c8->width_samples, (unsigned)b.width_samples);
 
     std::printf("LINKED clip: #%u window=%usmp  ch8 h=%d  ch0 h=%d flags=0x%02x\n",
                 (unsigned)b.index, (unsigned)b.width_samples, (int)c8->max_value,
@@ -336,9 +374,16 @@ static void testPerChannel() {
         CHECK(c1->width_us >= 1 && c1->width_us < c0->width_us,
               "PER_CHANNEL #%d: ch1 width %uus vs ch0 %uus", e, (unsigned)c1->width_us,
               (unsigned)c0->width_us);
-        CHECK(b.width_samples >= c0->width_samples,
-              "PER_CHANNEL #%d: window %u narrower than ch0 %u",
-              e, (unsigned)b.width_samples, (unsigned)c0->width_samples);
+        // The window is the group's span; each channel's width is that channel's own
+        // duration (its excursion widened by the envelope correction).  Those are
+        // different quantities now (see the note in testLinked): the widest channel's
+        // duration can reach past the window the excursions fit in, so the window is
+        // NOT expected to cover it.  What PER_CHANNEL is about is that each channel
+        // timed itself - the ordering above - inside one group window that really does
+        // span them.
+        CHECK(b.width_samples >= c1->width_samples,
+              "PER_CHANNEL #%d: window %u is shorter than the narrow channel %u",
+              e, (unsigned)b.width_samples, (unsigned)c1->width_samples);
         CHECK(near(c1->max_value, 500, 700), "PER_CHANNEL #%d ch1: height %d, expected ~600",
               e, (int)c1->max_value);
         CHECK(c1->area > 0 && c1->area < c0->area,

@@ -54,14 +54,17 @@ does the **M7 pass first, then the M4 pass**, and why `-Split` exists.
 | `signal_gen.{h,cpp}` | Bench-test synthetic signal generator (drives the two DACs) |
 | `flash.ps1` | Builds + uploads both GIGA cores (M7 first, then M4) over `arduino-cli` |
 | `monitor.ps1` | Opens a serial terminal on the board via `arduino-cli monitor` |
-| `test/model_check.py` | Python mirror of the detector + synthetic validation |
-| `test/model_check_aggregator.py` | Python mirror of the aggregator (LINKED / PER_CHANNEL) |
+| `test/model_check.py` | Python mirror of the detector + synthetic validation (**out of date**: still the pre-rework rule set - see the file header) |
+| `test/model_check_aggregator.py` | Python mirror of the aggregator (LINKED / PER_CHANNEL) (**out of date**, same reason) |
+| `test/detector_audit.py` | Ground-truth audit of the detector against the generated waveform (**out of date**; `test/test_bench_detect.cpp` does this against the real C++ now) |
 | `test/signal_model.py` | Python mirror of `signal_model.h` (bench waveform: pulses, merged pairs, glitches, impulses) |
 | `test/plot_signals.py` | Plots the AD7606 input waveform + detector verdicts (SVG/HTML, no deps) |
-| `test/live_plot.py` | Live viewer for the serial sample stream (`T` command) in the browser |
+| `test/live_plot.py` | Live viewer for the serial sample stream (`T` command) in the browser; `--sim` draws the bench harness's own firmware verdicts instead of a Python mirror, and `--sim-ladder` swaps the random train for the floor ladder - the isolated near-baseline staircase the pane's own scale can show |
+| `test/stream_check.py` | Contract check for the harness → viewer text protocol: runs `test_bench_detect.exe --stream` (and again with `--ladder`, where the report must stay off the stream), feeds its stdout through `live_plot.py`'s own parser and fails on any line, count or window the viewer stopped understanding |
 | `test/test_event_detector.cpp` | C++ unit test for the detector (host) |
 | `test/test_event_aggregator.cpp` | C++ unit test for the aggregator (host) |
 | `test/test_signal_model.cpp` | C++ unit test for `signal_model.h` (host) |
+| `test/test_bench_detect.cpp` | Bench-loopback harness: the real detector + aggregator over the real `signal_model` waveform, scored against the model's own pulse train (widths, grouping, spike-set `max=`). `--peaks` prints the per-span inventory - what the model drew, what the firmware answered, and the reference it judged it against - `--ladder` runs the floor ladder instead (isolated pulses of one width, apexes stepping up from below the floor, printed rung by rung: the run that makes the detection floor visible and measurable), and `--start live` replays the board's own power-up, where the pulses run through the quiet period |
 | `test/run_tests.ps1` | Builds & runs the C++ unit tests |
 | `test/verify_adc_pinmap.ps1` | Checks the AD7606 pin map (config.h vs README vs GIGA core) |
 
@@ -222,7 +225,7 @@ maximum (0–5 V → ±5 V, 0–10 V → ±10 V). The unused sign bit costs noth
 the part's own noise floor on the ±5 V range is already several LSB rms.
 
 Wiring a single-supply sensor:
-
+]]]]]]]]]]]]6ed 
 * **Tie the sensor ground to the module's `AGND`** (and the GIGA's GND). A
   single-supply sensor's "0 V" is only 0 V relative to that node — a floating
   ground is the number one cause of a bogus offset on unipolar signals.
@@ -241,8 +244,9 @@ signed counts and the detector only looks at deviations from its adaptive
 baseline), but the **absolute** count bounds scale ×2 when moving from ±10 V to
 ±5 V at the same signal voltage — `DET_MIN_MAX_VALUE`, `DET_MIN_AREA`,
 `DET_MAX_SLOPE` and the bench `SIGNALGEN_ADC_PER_DAC` (2.64 → 5.28). The
-σ-relative ones (`DET_K_ON`/`DET_K_OFF`/`DET_K_GATE`, `DET_SIGMA_FLOOR`) are
-scale-free and need no change.
+σ-relative ones (`DET_K_ON`/`DET_K_OFF`/`DET_K_GATE`, `DET_SIGMA_FLOOR`) and the
+ones counted in samples (`DET_MIN_WIDTH_SAMPLES`, `DET_MIN_RISE_SAMPLES`,
+`DET_IMPULSE_FILTER_TAPS`) are scale-free and need no change.
 
 If you truly need a 0–5 V signal to occupy the whole 16-bit span: a single-supply
 gain stage (0–3.3 V × ~1.52 → 0–5 V, rail-to-rail op-amp on the existing 5 V
@@ -257,27 +261,105 @@ not compatible with this driver).
 
 For every sample `x` of one channel (the detector runs once per channel):
 
-1. **Idle / warm-up**: keep a running estimate of the baseline (EMA mean) and the
-   noise level (`sigma`, EMA of the variance). The reference is refreshed **only
-   while the signal is inside the noise band** (`|x - baseline| <= k_gate*sigma`);
-   this prevents a slowly rising peak from dragging the baseline/sigma along with
-   it, and it is also what "freeze the baseline during an event" means in
-   practice.
-2. **Event start**: when `x > baseline + k_on*sigma`, latch a frozen reference
-   (`baseline`, `sigma`) and begin an event.
-3. **During the event**: the reference stays frozen. Track the maximum value, the
-   area (running sum of `x - baseline`) and the width (samples/time).
-4. **Event end**: when `x < baseline + k_off*sigma` for `end_debounce`
-   consecutive samples (hysteresis, `k_off < k_on`), close the event.
-5. **Validation**: accept only if it passes every bound; otherwise mark it
-   rejected with a reason (`PeakRejectReason`). The key "false peak" test is the
-   **shape** check: `max_value / width_samples <= max_slope`, i.e. a spike that is
-   *too short for its height* is rejected.
+0. **Input conditioning**: every sample passes through a running median of
+   `DET_IMPULSE_FILTER_TAPS` samples (`ImpulseFilter`) before anything else. A
+   noise impulse is taller than any real peak but only a few samples wide, so it
+   must not be able to start an event, end one early, or - the symptom that shows
+   up in the `max=` column - become the event's maximum. Everything the detector
+   reports (the baseline/noise statistics, the thresholds, the width, the area and
+   the maximum) is measured on that filtered stream, so `max_value` is the maximum
+   of the underlying signal instead of the highest single sample the noise
+   produced. The price is a fixed delay of `taps/2` samples (0.3 ms at 10 kSPS with
+   the default 7), which shifts every timestamp by that much but no width, because
+   both ends of an event move together.
 
-Tuning lives in `config.h` (`DET_*` macros). The two EMA weights are deliberately
-slow (`0.001`) — the tracker must be much slower than an event. If you change the
-sample rate or the expected event duration, revisit `baseline_alpha`/`noise_alpha`,
-`warmup_samples`, and the `DET_MIN_*` / `DET_MAX_SLOPE` bounds.
+   The default is 7, not 3, because the spike has to be caught **after** the analog
+   path. The generator (and an EMI pickup) writes an impulse as a single sample, but
+   what the AD7606 hands back is that impulse spread over two to four samples: the
+   DAC and the converter's anti-alias filter do not settle inside the 100 µs sample
+   period. A 3-tap median lets such a spike straight through, and it then does
+   exactly the damage this stage exists to prevent. Measured on the model waveform
+   with a 2-4 sample front end, over 6 cycles (24 real pulses): taps=3 reported 49
+   events, one with a `max=` up to +315 counts above anything the noise-free trace
+   contains, and taps=5 still leaked a 3-sample spike. taps=7 removes them all at 1,
+   2, 3 and 4 front-end taps, and taps=9 measures the same.
+1. **Quiet period**: detection is disarmed and the reference is *established* from
+   what the signal does here: `DET_QUIET_SAMPLES` samples (0.3 s at 10 kSPS), of
+   which `DET_QUIET_SEED_POINTS` are taken spread over the whole period. The mean is
+   their median and `sigma` is their MAD (`median |x - median|` x 1.4826), so a
+   single outlier - or a pulse that lands inside the quiet period - cannot decide
+   either estimate (a median/MAD pair tolerates up to 50% contamination; the
+   `(p84 - p16) / 2` it replaced broke down at 16%, and a sigma that comes out too
+   large puts the trigger *above* every real peak, i.e. the detector goes blind).
+   The source has to be idle for the period: that is the operator's side of the
+   bargain, and it is why the input should settle before the board starts.
+2. **Idle**: the reference is only ever *maintained* now - a slow EMA of the mean and
+   the variance, refreshed **only while the signal is inside the noise band**
+   (`|x - baseline| <= k_gate*sigma`, the gate capped in absolute counts), and the
+   *variance is not refreshed at all while a window is open* (from the sample the trace
+   leaves the band until it is back inside it). The mean keeps tracking through an
+   excursion - it is what follows a slow wander - but `sigma` does not, because the gate
+   is wider than the band (`k_gate` > `k_off`): a faint peak's own lower flank sits inside
+   the gate and would feed its own rise into the noise estimate, lifting the trigger
+   (`base + k_on*sigma`) as the peak climbs until the peak stays under it. Measured at 600
+   samples: `sigma` 13.5 -> 19.2 counts across one 60-count rung, i.e. the trigger from
+   +68 to +96 counts, above that rung's own apex, so the rung was never crossed. It is
+   never re-seeded and never takes a step either way, which is what "stable baseline"
+   means in practice: a rising peak cannot drag it along, and one outlier cannot move it.
+3. **Window and rise candidate**: two things happen here, on two different samples. The
+   *window* opens the moment the trace leaves the noise band (`x > baseline +
+   k_off*sigma`), and that sample is remembered: it is where the event starts, the span
+   the width is measured over, and the span the aggregator times every other channel
+   inside. A trace that comes back into the band for more than `DET_DIP_TOLERANCE`
+   consecutive samples before it reaches the trigger takes the window with it - it was a
+   band crossing, not an event. The *candidate* starts where the trace crosses the
+   trigger (`x > baseline + k_on*sigma`): there the reference is latched (`baseline`,
+   `sigma` frozen for the rest of the event) and the rise test begins - a real rise
+   lasts, so the candidate has to survive `DET_MIN_RISE_SAMPLES` (2 ms) samples counted
+   from the window's opening edge, and while it does it may dip back into the band for up
+   to `DET_DIP_TOLERANCE` (3) **consecutive** samples. A candidate that does not survive
+   is a noise event - a spike, a blip, a dropout - and it is **suppressed**: nothing is
+   reported for it at all, not even a rejected line.
+4. **Event**: the excursion is measured (height, area, leading edge) until the
+   signal has settled back into the band (`x < baseline + k_off*sigma` for
+   `end_debounce` consecutive samples, hysteresis `k_off < k_on`), and the event
+   **ends on the first sample of that run** - the window is the excursion, not the
+   excursion plus the debounce. Everything is final at that sample: one event, one
+   report. Both ends of the window sit on the same level (`k_off*sigma`), which is also
+   the level the *duration* is read back at: the verdict, the `width=` on the link and
+   the number the operator reads are derived from the excursion by inverting the pulse's
+   own envelope (`EventDetector::envelopeDuration`) - a faint pulse spends part of its
+   length inside the band, so the excursion under-reads it (117 samples / 1.2 ms on
+   average over the bench's 12-cycle run) while the floor `DET_MIN_WIDTH_SAMPLES` is a
+   statement about the length. Two details of the measurement:
+   * it runs on a **slope-bounded path**, not on the raw sample: the path follows
+     the filtered sample but may move at most `DET_MAX_SLOPE` counts per sample, so a
+     lone impulse can neither become the reported height nor end an event early, and
+     the same bound judges the descent;
+   * a sample where the *signal* jumped more than `DET_MAX_SLOPE` ahead of the path
+     (while the path was already inside the excursion) is flagged: the reported
+     height stays bounded, but an excursion that jumped is not a peak - that is what
+     tells a burst of impulses apart from a pulse.
+5. **Validation**: accept only if it passes every bound; otherwise report it as
+   rejected with a reason (`PeakRejectReason`). The bounds are amplitude, width and
+   area (`DET_MIN_MAX_VALUE` - checked once more *before* reporting, so a dither
+   excursion that never reached it is suppressed rather than logged;
+   `DET_MIN_WIDTH_SAMPLES` 3.5 ms; `DET_MAX_WIDTH_SAMPLES` 2 s as the stuck-signal
+   guard; `DET_MIN_AREA`), followed by the **shape** guards, which judge the
+   *leading edge* - the samples from the event start to its maximum: the edge must
+   last at least `DET_MIN_RISE_SAMPLES` samples (a step, i.e. a rectangular glitch or
+   whatever a spike leaves behind, is already at its top when it starts, while a real
+   peak climbs over hundreds of samples) and must not have jumped (`DET_MAX_SLOPE`
+   counts per sample).
+
+Tuning lives in `config.h` (`DET_*` macros), and every sample-counted value there
+carries its equivalent in milliseconds at the rate the loop runs at (10 kSPS). The two
+EMA weights are deliberately slow (`0.001` ≈ a 1 s time constant); `DET_QUIET_SAMPLES`
+is the quiet period that establishes the reference. If you change the sample rate or
+the expected event duration, revisit all of them together - in particular
+`DET_MIN_RISE_SAMPLES` (the rise test, 2 ms in the shipped config) has to stay below
+the shortest *real* leading edge the sensor produces, or real events are rejected as
+too fast.
 
 ## Event aggregation (`event_aggregator.h`)
 
@@ -289,13 +371,22 @@ How the channels are tied together is chosen in `config.h`:
 
 | `SORTER_METRIC_MODE` | Behaviour |
 |---|---|
-| `1` (linked, default) | The **primary channel** (`SORTER_PRIMARY_CHANNEL`) times the event: its own on/off crossing opens and closes the shared window. Every other channel's height/area is measured **inside that window only** (a channel that rises earlier or later is clipped and flagged `TRUNCATED`), and all channels report the primary's width — so one event has exactly one width. |
+| `1` (linked, default) | The **primary channel** (`SORTER_PRIMARY_CHANNEL`) times the event: the sample its trace leaves its own noise band opens the shared window and the sample it comes back into the band closes it. Every other channel's height/area is measured **inside that window only** (a channel that is still well inside its own excursion when the window closes - a second peak rising inside it - is clipped and flagged `TRUNCATED`), and all channels report the primary's width — so one event has exactly one width. |
 | `0` (per-channel) | Every channel is timed on its own (own start/end/width, so widths may differ). The event is reported once **all** channels that entered it have closed; the detector's `max_width_samples` guard closes a channel that never returns, so an event can never hang. |
 
 In both modes the bundle carries the event window (start/end/width), the channel
 that resolved the verdict (`primary`) and the mode, plus one record per channel in
 `SORTER_ACTIVE_CHANNEL_MASK`. A channel that never rose is reported as absent
 (`flags == 0`), so it is not mistaken for a zero-height peak.
+
+A **suppressed** rise candidate (see the rise test above) is suppressed for the
+aggregator too: in linked mode the shared window the primary's trace opened is
+dropped with it, and in per-channel mode the channel leaves the open group - so a
+blip can neither be reported nor hold a group open, and a group in which every
+candidate was suppressed is not reported at all. The same holds for a window that never
+became an event at all: a band breakout the trace dipped back out of leaves the
+detector's window closed, and the aggregator's window (or the channel's place in the
+group) goes with it, so the next breakout opens a fresh one.
 
 Pick a primary (`SORTER_PRIMARY_CHANNEL`) that appears in **every** event; with the
 bench loopback that is channel 8 (the module-1 DAC input). Use `0` for per-channel
@@ -314,11 +405,13 @@ the per-channel metrics are assembled:
   `bundle.reason = REASON_RAILED`, `bundle.valid = 0`, and the railed channel(s)
   carry `CH_FLAG_RAILED`. The M7 prints `*** SIGNAL TOO BRIGHT ***`, the operator's
   cue to reduce the source intensity. The channel stays held while the input remains
-  bright; once the signal returns to range the stale reference is discarded (the
-  detector is re-baselined, *keeping* its noise estimate so it does not chatter) and
-  detection resumes. The notification is emitted once per rail episode (re-armed
-  only after every channel has recovered), so a stuck-bright source cannot flood the
-  link. Tune with `DET_RAIL_LEVEL` / `DET_RAIL_WIDTH` / `DET_RAIL_COOLDOWN`.
+  bright; once the signal returns to range the stale reference is discarded and the
+  detector starts a **fresh quiet period** (`DET_QUIET_SAMPLES`) instead of trusting
+  the one sample that follows the episode — the level is re-established, not guessed,
+  so detection on that channel is blind for that period. The notification is emitted
+  once per rail episode (re-armed only after every channel has recovered), so a
+  stuck-bright source cannot flood the link. Tune with `DET_RAIL_LEVEL` /
+  `DET_RAIL_WIDTH` / `DET_RAIL_COOLDOWN`.
 
 * **Channel polarity.** Some channels idle HIGH and *dip* when an event occurs — in
   the real application the primary (9th) channel, index 8, is the complement of the
@@ -454,12 +547,17 @@ validated without the board:
   ```powershell
   py -3 test\model_check.py             # detector
   py -3 test\model_check_aggregator.py  # aggregator (LINKED + PER_CHANNEL)
+  py -3 test\detector_audit.py          # detector vs the generated waveform, scored
   ```
   `model_check.py` mirrors the C++ detector and runs a synthetic signal (baseline +
-  noise, three broad peaks, two glitches). `model_check_aggregator.py` mirrors the
-  C++ aggregator and checks both modes: in LINKED every channel inherits the
+  noise, three broad peaks, a flat glitch and a 1-sample one). `model_check_aggregator.py`
+  mirrors the C++ aggregator and checks both modes: in LINKED every channel inherits the
   primary's window, in PER_CHANNEL each channel keeps its own width. Both print
-  `PASS`.
+  `PASS`. `detector_audit.py` goes further and *scores* the detector against the
+  bench waveform the model itself draws: it reports the false accepts (`GHOST`), the
+  missed peaks, and how far the reported `max=` drifts from the noise-free apex -
+  which is how the input filter and the shape guards were tuned. Run it with
+  `[cycles]` (1 cycle = 2.0 s) and read the summary table at the end.
 
 * **Signal plot (no hardware, no third-party packages)**
   ```powershell
@@ -478,19 +576,22 @@ validated without the board:
   (`SIGNALGEN_ADC_PER_DAC`: 2.64 at ±10 V, 5.28 at ±5 V), so a ±5 V run reports the
   programmed peak heights instead of twice them.
 
-* **Live sample stream (needs the board, or `--sim`)**
+* **Live sample stream (the board, or `--sim` for the firmware without one)**
   ```powershell
-  py -3 test\live_plot.py --sim              # no board: signal_model.py generates
+  py -3 test\live_plot.py --sim              # no board: the bench harness runs
   py -3 test\live_plot.py --port COM7        # the real board
+  py -3 test\live_plot.py --stdin < bench.txt    # a capture, or a pipe
   ```
   `live_plot.py` sends `T1` (the monitor's stream-on command, so the M7 always
   re-prints its `STREAM` header) to switch the sample stream on, parses the
   `S,<index>,<gen>,<ch>:<count>,...` lines and
   pushes them over Server-Sent Events to a small page it serves on
   `http://127.0.0.1:8000/` - a rolling window of the expected and measured traces
-  in AD7606 counts, the point rate, the newest sample index, and a text pane with
-  everything the board prints that is not a sample line (STREAM header, boot banner,
-  every closed event with its verdict). The window is measured in **time**: the last
+  in AD7606 counts, the point rate, the newest sample index, the width floor the
+  detector is judging with (`minw=` in the header: 35 samples = 3.5 ms of *duration* at
+  the defaults), and a text pane with everything the board prints that is not a sample
+  line (STREAM header, boot banner, every closed event with its verdict). The window is
+  measured in **time**: the last
   `--window` seconds (1 by default), with a slider in the control bar to stretch or
   tighten it. Time rather than a point count is what keeps the pane readable, because
   the number of events in it then follows the window instead of piling up in a fixed
@@ -498,37 +599,114 @@ validated without the board:
   second at most), and widening it redraws from the `--history` seconds (8 by default,
   capped at 60) each trace keeps, without waiting for new samples. Pure stdlib plus your
   browser: no `pyserial`, no npm. Ctrl+C sends `T0` so the 1000 lines/s flood stops again
-  (`--keep-streaming` leaves it running). `--sim` paces `signal_model.py` in real
-  time and feeds the `model_check.py` detector, so the viewer can be exercised with
-  nothing plugged in; `--window`, `--history`, `--range`, `--channels`, `--http-port`
-  and `--sim-speed` tune it. `--range` must match the RANGE strap (it scales the volts
-  labels, the `expected waveform` overlay and the simulator's counts, exactly like the
-  firmware's `SIGNALGEN_ADC_PER_DAC`). The page draws the traces in AD7606 counts and,
-  by default, fits the vertical axis to whatever is in the window; tick **full scale**
+  (`--keep-streaming` leaves it running).
+
+  `--sim` runs the **firmware**, not a mirror of it. It starts
+  `test/test_bench_detect.exe --stream` (built by `test/run_tests.ps1`), which drives
+  the *shipped* `EventAggregator` and `EventDetector` over `signal_model.h`'s bench
+  waveform and prints the board's own serial text for that run - the `STREAM on:`
+  header, one `S,` line per stream point and `printBundle()`'s event lines. The viewer
+  replays that text at 10 kSPS through the very parser the COM port feeds, so the
+  overlay is the firmware's decision on the samples it was given, and the log pane holds
+  the harness's own verdict (`14 event(s) (14 VALID), 0 missed, ...`) next to the peaks
+  it is talking about; nothing is interpreted on the way through. `--sim-cycles` (4; one
+  cycle = 2 s of stream), `--sim-speed` (N× real time, `0` = as fast as the host
+  manages), `--sim-start live` (the board's power-up, where the pulses run through the
+  detector's quiet period), `--sim-frontend 1|3`, `--hw` (two slightly mismatched
+  modules), `--sim-seed`, `--sim-repeat` (loop the capture, continuing the sample
+  indices) and `--firmware EXE` pass straight through. `--sim-cycles 16` is the one to
+  reach for when watching the DC drift: one cycle is 2 s whereas `BASELINE_WAVE_SAMPLES`
+  makes the wander 30 s long, so a 4-cycle capture shows only a slice of it (and
+  `--sim-repeat` restarts the drift on every pass). A built harness is required, and
+  `--sim` puts the compiler's DLL folder on the child's `PATH` the same way
+  `run_tests.ps1` does, so nothing has to be on PATH to run it.
+
+  `--sim-ladder` runs the harness's **floor ladder** instead of the random train
+  (`SIGNALGEN_LADDER_*` in `config.h`): a staircase of *isolated* pulses of one width,
+  apexes stepping from inside the dither band up to a few hundred counts, one rung per
+  slot of the cycle, with no random pulses, no glitches and no impulses drawn at all.
+  It exists because the random train cannot show a small peak: its gaps are 3-90 ms
+  against 120 ms-wide pulses and 80 % of its pulses fuse with a neighbour, so a
+  300-count apex is a shoulder on a 900-count slope, and the pane's own scale is set by
+  the train's full range (~10 000 counts, the DAC clamp) - two or three pixels. Measured
+  over 8 cycles: the 19 spans carrying a pulse under 500 counts sit 42-1400 samples from
+  neighbours 500-3165 counts tall, i.e. smaller than the ±1056-count impulse spikes
+  sharing the trace.  With the ladder the pane settles near 1000 counts instead - 0.37 px
+  per count on the 368-px plot area - so the ±42-count dither band is ±15 px, a
+  100-count rung 37 px and the 460-count pinnacle 169 px: "how close to the baseline can
+  a peak be and still be detected" becomes something to *look at*, with the firmware's
+  own windows drawn over the rungs it took and the rung-by-rung table (`---- floor
+  ladder: ...` out of the harness's stderr) in the log pane next to them.  The same run
+  as a table on its own: `test\test_bench_detect.exe --ladder`, whose
+  `--ladder-width / --ladder-min / --ladder-step / --ladder-count` flags move the
+  staircase and make it finer - pipe its `--stream` into `--stdin` for a width the viewer
+  has no flag for.
+
+  A `--sim` run is a snapshot of *one build*: the log pane names the build it came from
+  (`bench: harness built 2026-10-09 17:01:04`), and shouts when the exe is older than
+  the sources it was compiled from. Rebuilding `test_bench_detect.exe` while the viewer
+  is up **replays the new capture** with the sample indices continuing, so a page still
+  showing the previous waveform needs no restart - which, along with `--sim-cycles 16`,
+  is the answer to "the page does not show the updated test signal". (The board path has
+  the same trap in its own form: the browser can only draw the firmware that is
+  actually flashed, so a `--port` page shows `signal_gen.cpp`'s waveform as of the last
+  download, not as of the last edit.)
+
+  `--stdin` reads that same text from a capture file or a pipe, which is what makes a
+  saved monitor session reviewable after the fact:
+  `test\test_bench_detect.exe --stream | py -3 test\live_plot.py --stdin`.
+  `--window`, `--history`, `--range`, `--channels` and `--http-port` tune the view.
+  `--range` picks the AD7606 strap the page's volts labels and `expected waveform`
+  scale are read with (`SIGNALGEN_ADC_PER_DAC`: 2.64 at ±10 V, 5.28 at ±5 V), which is
+  also where the COM-port path's counts come from; the `--sim`/`--stdin` counts come out
+  of `config.h` instead, so a `--range` that disagrees with how that firmware was built
+  is reported in the log pane rather than silently rescaling them. The page draws the
+  traces in AD7606 counts and,
+  by default, fits the vertical axis to whatever is in the window, in quantised 1-2-5
+steps: it grows the moment a sample does not fit and shrinks only after a smaller range
+has held for around a second, never below ~800 counts, so the trace does not jump around
+the pane as tall peaks and impulses come and go and a quiet window shows noise as noise;
+tick **full scale**
   to pin it to ±32768 counts instead, which is how much of the ADC you are actually
   using. In the bench loopback that is only ~10166 counts at ±10 V (~20333 at ±5 V),
   because the generator stops at the DAC's 3.1 V clamp - see *Levels* below.
 
   Every closed event is also drawn over the traces as the decision the detector took,
   which is what makes a buried or merged pulse readable at all: the window it claimed
-  (shaded, with both edges), the width in samples, the baseline it froze for that
+  (shaded, with both edges), the width it judged, the baseline it froze for that
   window (dashed violet line) and the peak it reported on top of that baseline (dashed
   line in the verdict's colour - green accepted, orange rejected). Each window carries
-  a tag, `#12 ch0 VALID  w=24smp  max=1042  base=5412`, and the log pane still holds the
-  M7's own wording for the same event; tick **detector overlay** off to see the bare
-  traces. All of it comes from the lines `printBundle()` already prints, so the board
-  needs no change; the numbers are exactly the ones the log shows, and the tag names
-  the channel they came from (a window carries one line per active channel, and the
-  overlay shows the one whose crossing opened it). In the default
-  `SORTER_METRIC_MODE = 1` (linked) the shaded window *is* the detected width, so the
-  band, the edges and `w=` agree; with per-channel metrics a channel may be narrower
-  than its group window, and the tag then adds `(win Nsmp)`. The window's microsecond
+  a tag, `#12 ch0 VALID  w=54smp (exc 32smp)  max=1042  base=5412`, and the log pane
+  still holds the M7's own wording for the same event; tick **detector overlay** off to
+  see the bare traces. All of it comes from the lines `printBundle()` already prints, so
+  the board needs no change; the numbers are exactly the ones the log shows, and the tag
+  names the channel they came from (a window carries one line per active channel, and the
+  overlay shows the one whose crossing opened it). `w=` is the *duration* the verdict was
+  judged with (the excursion widened for the pulse's own envelope, see
+  `EventDetector::envelopeDuration`), while `(exc Nsmp)` is the span the measurement
+  actually covered - printed only when the two differ, which is what a faint pulse does.
+  Every window also carries the
+  **width floor** the board judged it against: a brown dotted **band** `minw` samples
+  wide, centred on the window (`DET_MIN_WIDTH_SAMPLES`; 3.5 ms of *duration* at the
+  defaults, printed in the `STREAM` header, so the drawing cannot drift from the
+  firmware). The duration the detector measured for that window is drawn as the dashed
+  rule along the event's own baseline, and that rule is coloured by the **width question
+  alone**: green while the duration cleared the band, orange only when the floor is what
+  refused the window. A rule that falls short of the band is an event refused as too
+  narrow; one that reaches past it is an event the width bound let through, whatever the
+  verdict says - a needle refused on the *shape* bounds (`rej SHORT_FOR_HEIGHT`) keeps a
+  green rule, and its tag spells the comparison out (`w=54smp (exc 46smp) >= floor 35smp`
+  against `w=27smp (exc 24smp) < floor 35smp` for the one the floor did refuse). In the
+  default `SORTER_METRIC_MODE = 1` (linked) every channel's `w=` is the primary's
+  duration, so the band, the edges and `w=` are all the same measurement; with per-channel
+  metrics a channel may be narrower than its group window, and the tag then adds
+  `(exc Nsmp)`. The window's microsecond
   stamp is converted at the stream's sample rate, and a window narrower than
   `SORTER_STREAM_DECIM` samples can fall between two plotted points - the tag still
   reports what the detector measured.
 
-  Two things the lines cannot show are read back off the *plotted* points and drawn in
-  colours of their own (never one of the channel colours):
+  Three things the lines cannot show are read back off the *plotted* points and drawn
+  in colours of their own (never one of the channel colours):
 
   * **a window that swallows two peaks.** The log says one `VALID` event with a wide
     window, which is exactly what a merged pair looks like. The trace says where the
@@ -538,36 +716,79 @@ validated without the board:
     detector cannot end it until the trace has been below `base + k_off*sigma` for
     `DET_END_DEBOUNCE` samples - so this is the overlay saying "that wide window is two
     pulses", not "the detector was wrong";
-  * **a `max=` the window's own samples cannot carry.** An impulse is a sample the
-    detector is right to take, but it hides the height of the pulse underneath it,
-    which is all a reader of `max=` wants. A blue dotted line is drawn at the height
-    the trace does support - with a square on the one sample that reaches the max, when
-    there is one - and the tag says how sure the reading is: `!max (trace 1170)`
-    when *no* plotted sample comes near the reported max - the impulse fell between two
-    `SORTER_STREAM_DECIM` samples, so the trace disproves the max - or `?max (lone 637)`
-    when a single sample does reach it. A real apex is broad, so a lone point is "where
-    to look" rather than proof: a pulse sharper than the trace can draw looks the same.
+  * **a `max=` the window's own samples cannot carry.** The detector filters
+    single-sample impulses out of its input (`DET_IMPULSE_FILTER_TAPS`), so a `max=`
+    higher than anything the trace shows is now a signature of something else: a
+    spike wider than the filter, a window whose `base=` was frozen on a drifting
+    baseline, or a peak the decimated points stepped over. A blue dotted line is
+    drawn at the height the trace does support - with a square on the one sample that
+    reaches the max, when there is one - and the tag says how sure the reading is:
+    `!max (trace 1170)` when *no* plotted sample comes near the reported max, or
+    `?max (lone 637)` when a single sample does reach it. A real apex is broad, so a
+    lone point is "where to look" rather than proof: a pulse sharper than the trace
+    can draw looks the same;
+  * **a peak the trace climbs to too fast.** A bead is a dome: the AD7606 sees its edge
+    rising over milliseconds, not samples. The overlay walks back from the apex to the
+    last plotted point still within 10 % of the window's baseline and converts that to
+    the board's clock; if the climb is inside 1 ms the tag says `!rise <=1000us` (violet
+    line along that edge) - which at the default `SORTER_STREAM_DECIM 10` is one plotted
+    interval, so the note is a ceiling, not a measurement. It is the shape check the
+    numbers cannot do: a `VALID` window can be the right width and height and still be a
+    spike, an edge the analog front end is settling, or a bad sample - the same suspects
+    the `?max` note points at.
 
-  Both are read off the decimated points the canvas draws, so they describe what you
+  All three are read off the decimated points the canvas draws, so they describe what you
   can see, never replace the measured numbers in the tag. Each window is read back as
   soon as it has arrived and is on screen, so the stats line is a running count over the
-  whole session - `read back 204 windows: 6 two-peak, 9 max?` - and it keeps windows
-  that have since scrolled out of the trace; a window claiming `max=0` has no peak to
-  judge. The one blind spot is honest: an impulse the decimation *did* land on is drawn
-  as a plausible apex, so a max inflated that way can pass this check unnoticed.
+  whole session - `read back 204 windows: 6 two-peak, 9 max?, 0 fast rise` - and it keeps
+  windows that have since scrolled out of the trace; a window claiming `max=0` has no
+  peak to judge. The one blind spot is honest: an impulse the decimation *did* land on is
+  drawn as a plausible apex, so a max inflated that way can pass the `max?` check
+  unnoticed (its rise then looks fast, which is why the two notes are worth reading
+  together).
+
+  A bare spike with **no** window over it is not a missed peak: the bench waveform
+  deliberately injects glitches (`SIGNALGEN_SPIKE_PCT`/% of the samples carry an impulse
+  up to `SIGNALGEN_SPIKE_MAX`, plus the pattern's own glitch pulses), and the detector is
+  required to suppress them - `--peaks` judges each one `OK: a N-smp glitch was
+  suppressed, as it must be`, and the verdict counts them as `glitch-only` spans with
+  `spike-only 0` false accepts. A decimated trace draws only the glitches that happen to
+  land on a plotted sample, so they show up as isolated needles of up to a few thousand
+  counts with nothing over them. The windows and the glitches are read off the same
+  trace: a needle *inside* a window's band is what the `max?` note points at.
 
 * **C++ unit tests (need g++/clang++)**
   ```powershell
   pwsh test\run_tests.ps1
   ```
-  Builds and runs `test_event_detector`, `test_event_aggregator` and
-  `test_signal_model` against the real headers. If `g++`/`clang++` is not on `PATH`,
-  the script also looks in the usual
+  Builds and runs `test_event_detector`, `test_event_aggregator`,
+  `test_signal_model` and `test_bench_detect` against the real headers. If
+  `g++`/`clang++` is not on `PATH`, the script also looks in the usual
   install locations (the winget WinLibs package, MSYS2, MinGW-w64) — install one with
   `winget install BrechtSanders.WinLibs.POSIX.UCRT` if needed. If PowerShell refuses
   to run the script, use `powershell -ExecutionPolicy Bypass -File test\run_tests.ps1`.
   On a machine with no compiler at all the script points at the two Python checks
-  instead.
+  instead. Once the harness it built passes, it also runs the protocol check below.
+
+* **Stream protocol check (needs the harness above, plus Python)**
+  ```powershell
+  py -3 test\stream_check.py        # 4 cycles; --cycles/--decim/--exe/--range
+  ```
+  The C++ tests only ever see the C++ side of the harness's `--stream` text, and
+  `live_plot.py` draws nothing for a line it no longer recognises — so a reworded
+  `Event #` line would just stop producing overlays, silently, which is exactly how
+  the old Python mirror drifted. This runs the harness, feeds its stdout through the
+  viewer's own `StreamParser`/`StreamState`, and fails if the two disagree on the
+  `STREAM` header (decimation, channels, points per frame and the width floor the
+  overlay draws on every window - a band of `minw` samples of *duration*, plus the rule
+  each window was judged with), on the `S,` grid (one point
+  per line, indices one decimation apart, the frame count that stitches out of them),
+  on the printed events (one overlay each, carrying the window, width, baseline, peak
+  and verdict words the firmware printed) or on the harness's own verdict on `stderr`
+  (same event/VALID counts the viewer ended up holding). It prints `PASS` and exits 0,
+  or lists the line and the number that stopped adding up. `test/run_tests.ps1` runs it
+  for you; run it by hand after touching `printBundle()`, `--stream` or
+  `live_plot.py`'s parser.
 
 * **Pin-map check (needs the `arduino:mbed_giga` core installed)**
   ```powershell
@@ -578,7 +799,41 @@ validated without the board:
   and fails if a pin is used twice or carries an on-board peripheral function.
 
 The detector checks use the same scenario: the three broad peaks must be reported
-as VALID (max ~= 800, width ~= 1100 samples) and the two glitches rejected.
+as VALID (max ~= 800, width ~= 1100 samples, leading edge ~500 samples), the
+4-sample glitch rejected as `SHORT_FOR_HEIGHT`, and the 1-sample glitch not
+reported at all - the impulse filter removes it. Two further cases pin the fixes:
+an impulse of 2000 counts landing on and next to an 800-count peak must not become
+that peak's `max=`, and a flat 10-sample step of 500 counts (average slope only
+50 counts/sample) must be rejected.
+
+`test_bench_detect.cpp` is the end-to-end counterpart of those hand-built
+scenarios, and it is the one that found the two bugs the Python tools could not
+see. It runs the *real* `EventAggregator` (one `EventDetector` per channel) over
+the *real* bench waveform - `signal_model.h`'s own DAC counts - so its ground truth
+is the model's pulse train, not what the detector reported:
+
+```powershell
+test\test_bench_detect.exe --cycles 6 --detail   # one run, one line per event/span
+test\test_bench_detect.exe --cycles 6 --hw       # the two AD7606 modules differ
+test\test_bench_detect.exe --cycles 6 --sweep    # candidate tunings side by side
+test\test_bench_detect.exe --cycles 6 --peaks    # every model span vs its verdict
+test\test_bench_detect.exe --cycles 6 --report   # report, but never fail the shell
+test\test_bench_detect.exe --cycles 6 --min-rise 12 --min-width 40
+test\test_bench_detect.exe --ladder              # the floor ladder, rung by rung
+test\test_bench_detect.exe --ladder --ladder-width 200 --ladder-step 10
+```
+
+Without `--frontend` it puts the 3-sample analog front end of the bench section in
+front of the converter (`--frontend 1` reproduces the ideal pair the Python tools
+model: taps=3 passes *there*, which is exactly why the bug slipped through). It
+scores what the other tools never did - whether an event's width is the span it was
+injected as, whether a span came back as one event or two (and, when it was split,
+whether the noise-free trace really did dip back into the band for
+`DET_END_DEBOUNCE` samples), whether a `max=` is more than noise above the
+noise-free trace under that window, whether a VALID event covers a glitch or an
+impulse, and whether a channel is flagged `[truncated]` while its waveform is still
+coming back - and exits non-zero if any of them is wrong, which is why
+`run_tests.ps1` includes it.
 
 ## Bench test: DAC → AD7606 loopback (hardware-in-the-loop)
 
@@ -641,51 +896,284 @@ baseline**, so peaks are positive excursions — exactly what the detector's
    banner at boot.
 3. **Check the loopback.** Every metric line carries `base=`; with the wiring in
    place it must read ≈ **5407** (±10 V) or ≈ **10813** (±5 V). A `base=` near 0
-   means the DAC output is not reaching the ADC input.
+   means the DAC output is not reaching the ADC input. (The generator's own
+   `BASELINE_WAVE_*` drift moves that figure ±396 counts over 30 s, so anything in
+   5000-5800 is the wander, not a fault - it is slow enough that no bound can
+   mistake it for a peak, and `base=` should follow it rather than step.)
 4. **Watch one 2 s pattern cycle** (20 000 samples at 10 kSPS). Every cycle draws a
    *new* pulse train (`SIGNALGEN_*` in `config.h`), so the log lines differ from cycle
    to cycle - that is the point. Over a couple of cycles you should see:
 
    | injected | expected log line |
    |---|---|
-   | broad peak (raised cosine), 300-3000 samples wide | `VALID`; `max=` anywhere from `~200` counts (a peak that barely clears the noise band) up to `~4757` (a peak driven into the DAC clamp, whose top is then flat) |
+   | broad peak (raised cosine), 30-3000 samples wide | `VALID`; `max=` anywhere from `~120` counts (a pulse that only just clears the trigger - see *how small a peak can it see*, below) up to `~4757` (a peak driven into the DAC clamp, whose top is then flat). `WIDTH_SPAN_PCT` % of the peaks are needles down at `WIDTH_MIN` (3.0 ms) - see the row three below |
+   | small peak on the detector's frontier (`FRONTIER_PCT`, width in `FRONTIER_WIDTH_MIN..MAX` = 20-80 ms) | `VALID`, with `max=` only `FRONTIER_MARGIN_MIN..MAX` x the smallest apex the rise test can accept at that width (~250-550 counts at ±10 V): the *small* end of the train, drawn on purpose so the floor is exercised in every run. The audit prints the coverage it saw (`small peaks: N span(s) drawn within 4x the on-threshold, M VALID`) and fails if the waveform stops presenting them |
    | two peaks that overlap (`MERGE_PCT`) | ONE `VALID` event with `width` ~1.5-2.0 nominal widths: clearly wider than any single pulse, which is what makes the event-width distribution double-peaked |
-   | rectangular glitch, 1-6 samples, tall | `rejected SHORT_FOR_HEIGHT` (a very short one: `WIDTH_TOO_NARROW`) |
-   | single-sample impulse (`SPIKE_PCT`) | `rejected WIDTH_TOO_NARROW` (the event is 2 samples wide) |
+   | needle (raised cosine), `WIDTH_MIN`..~60 samples (3-6 ms) | `rejected WIDTH_TOO_NARROW` for the ones drawn under the floor, `rejected SHORT_FOR_HEIGHT` for the rest: the width bound is judged against the pulse's *duration* (`DET_MIN_WIDTH_SAMPLES`, the excursion above widened by the envelope inversion - see `EventDetector::envelopeDuration`), and `DET_MAX_SLOPE` (100 counts/sample) or the measured leading edge (`DET_MIN_RISE_SAMPLES`) is what then stops the ones the width test lets through. Either way a *record*, which is what keeps a 3 ms event visible on the link instead of silently missing (the bench's `rejectionJustified()` names the bound each rejection came from) |
+   | rectangular glitch, 1-6 samples, tall | `rejected SHORT_FOR_HEIGHT`: a rectangle is at its top the moment it starts, so the leading-edge guard catches it whatever its height - and a 1-sample one never becomes an event at all |
+   | single-sample impulse (`SPIKE_PCT`) | nothing at all: the impulse filter removes it before the detector can see it (before, it closed as a 2-sample event, `rejected WIDTH_TOO_NARROW`) |
+   | the DC level itself drifting (`BASELINE_WAVE_CODE` codes peak, `BASELINE_WAVE_SAMPLES` samples = 30 s per cycle) | nothing at all: the `base=` in every line follows the drift - that is what the baseline tracker is for - and no event is invented, because every bound is read against that level. A `base=` that steps, or a `VALID` event with a huge `width` and a tiny `max=`, is the tracker failing to keep up |
+
+   With `SIGNALGEN_LADDER = 1` (or the harness's `--ladder`) that whole train is
+   replaced by the **floor ladder**: isolated pulses of *one* width, one per slot of the
+   cycle, apexes stepping from inside the noise band up past the floor. Rungs below the
+   floor are *supposed* to be missed - they are the measurement, which is why the run
+   prints them rung by rung (and to *stderr* when it is streaming, so the page and the
+   table are the same run) instead of scoring them like a train. See *how small a peak
+   can it see*, below, and `SIGNALGEN_LADDER_*` in `config.h`.
+
+   The last row is the filter catching the *generator's* single-sample impulse. On
+   a real board the analog path spreads that same impulse over several samples (the
+   bench section above), which is why `DET_IMPULSE_FILTER_TAPS` defaults to 7: a
+   `max=` higher than the trace can carry, or a `rejected SHORT_FOR_HEIGHT` line
+   sitting right where a pulse's rising edge should be, means the filter is still
+   letting a smeared spike through - `test/test_bench_detect.exe --sweep` shows the
+   lengths side by side. A `[truncated]` flag on a channel whose waveform is visibly
+   still coming back up is the other signature, and it is the *window*, not the
+   filter: it is the module mismatch in `test_bench_detect.cpp --hw`.
 
    The measured `width` is a little shorter than the programmed pulse because the
    raised-cosine tails fall below the detection threshold, and a tall peak measures
    longer than a weak one (its flanks cross the threshold sooner).
+
+   **Watch the first cycles separately.** The quiet period that seeds the reference
+   runs while the generator is already drawing pulses (it starts at its own sample 0,
+   as `signal_gen.cpp` does not hold the DACs), so the board's *first* quiet period can
+   be mostly pulse. `test/test_bench_detect.exe --peaks --start live` replays exactly
+   that: the reference seeds to `base 5658, sigma 353 counts` - a `+1764`-count trigger
+   instead of the `+52..59` a noise-seeded run arms with - and in an 8-cycle run 3 of
+   the 90 peak spans are never reported while those that do come back measure ~113
+   samples narrower than the span that was drawn, until the gated EMA walks the
+   reference back to the noise over several seconds. How many are lost scales with how
+   busy the waveform is: at ~20 events per pattern cycle the 3000-sample quiet period is
+   never idle on this bench. That is what "a peak went missing" looks like on the bench
+   log right after a reset; the later cycles are the ones to judge the detector on (and
+   `DET_QUIET_SAMPLES` in `config.h` explains the fix).
 
 ### Tuning with the bench test
 
 * **`SIGNALGEN_*`** in `config.h` shape the waveform; the model itself is
   `signal_model.h`, mirrored by `test/signal_model.py` and verified by
   `test/test_signal_model.cpp` (`py -3 test/signal_model.py` prints the statistics and
-  an event-width histogram). The defaults are deliberately harsh - ~40 % of the pulses
+  an event-width histogram). `SIGNALGEN_LADDER = 1` replaces the whole train with the
+  *floor ladder* - isolated pulses of one width stepping up from below the detector's
+  floor, the pattern that makes the floor visible on the live plot and measurable rung
+  by rung (see *how small a peak can it see*, above). The defaults are deliberately
+  harsh - ~40 % of the pulses
   are glitches, ~14 % of the pulses fuse with the previous one into a pair,
   `HEIGHT_SPAN_PCT` % of the peaks are drawn log-uniform over the whole span, the
   dither is ±`NOISE_CODE` DAC codes and `SPIKE_PCT` % of the samples carry an impulse
   of up to ±`SPIKE_MAX` codes. `MERGE_PCT` is the *attempt* rate, not the result: a
   merge only lands when the two shapes really do overlap, so the share that fuses
   follows from the drawn widths and gaps.
+* **The waveform is deliberately harder than the detector's envelope**, which is what
+  the last three knobs are for: `WIDTH_SPAN_PCT` % of the peaks are needles drawn
+  log-uniform down to `WIDTH_MIN` (3.0 ms), the gaps run `GAP_MIN`..`GAP_MAX`
+  (0.3-90 ms) so a 2 s cycle carries ~20 events instead of ~4, and `BASELINE_WAVE_*`
+  drifts the whole DC level by ±150 codes (±396 counts) over a 30 s sine. None of it is
+  decoration - it is a statement of what the machine has to survive, and on the shipped
+  bounds the detector does: `--cycles 6` (12 cycles in the note below) reports 0 missed,
+  0 ghost, 0 spike-set `max=`, 0 `[truncated]`, 0 half-width event, 0 peak rejected
+  *inside* the envelope, and tracks the drift (`sigma` ~10 counts, `base=` walking with
+  the wander). What the needles expose is the envelope itself. The width the bounds are
+  compared against is the pulse's *duration* - the excursion widened by inverting the
+  pulse's own envelope - and over 12 cycles that number lands within 12 samples (0.12 ms)
+  of the width the generator drew, on average (|max| 165), where the excursion itself (the
+  span the window covers) is 117 samples short of it (|max| 435). With the window opening
+  on the noise band, both of its ends sit on the same level and the relation inverts
+  cleanly, so the bound is 3.5 ms / 35 samples: the tightest floor that still rejects
+  every needle drawn *below* the requirement without refusing one drawn *over* it (the
+  bench's own width clause fails the run if a pulse drawn at or over the floor comes back
+  `WIDTH_TOO_NARROW`, with a 4-sample resolution for the measurement itself). A needle is
+  still judged against three bounds at once - `DET_MIN_WIDTH_SAMPLES` (3.5 ms),
+  `DET_MIN_RISE_SAMPLES` (2 ms) and `DET_MAX_SLOPE` (a 3000-count needle rises ~200
+  counts/sample, twice the bound) - so one drawn below the requirement comes back as
+  `rejected`, a *record* on the link rather than a silence, and the
+  harness counts it as "below the documented floor" instead of as a lost peak.
+  `--min-rise N` / `--min-width N` move those bounds for one run without recompiling,
+  and `--sweep` lays the candidates out side by side (its own 4-cycle run, so the counts
+  are comparable across rows rather than to the note above):
+
+  | candidate (fe=3, shipped taps) | events | VALID | rejected in-envelope | below floor | `[truncated]` |
+  |---|---|---|---|---|---|
+  | rise ≥ 20, width ≥ 35 (**shipped**) | 42 | 40 | 0 | 2 | 0 |
+  | rise ≥ 12, width ≥ 40 | 45 | 42 | 0 | 0 | 0 |
+  | rise ≥ 10, width ≥ 30 | 55 | 42 | 0 | 0 | 12 |
+  | rise ≥ 8, width ≥ 25 | 61 | 42 | 0 | 0 | 20 |
+  | rise ≥ 6, width ≥ 20 | 63 | 42 | 0 | 0 | 24 |
+
+  The first two rows are both clean - `rise ≥ 12` / `width ≥ 40` even recovers two
+  more needles - but the moment the rise bound drops to 10 the audit fails, and not on
+  a missed peak: 12 `[truncated]` windows, the shared window closing in the middle of a
+  rising edge. That is the promotion/end-test coupling `config.h` describes under
+  `DET_MIN_RISE_SAMPLES` (the candidate is promoted before the slope-bounded path has
+  climbed past the off-threshold, so the end test fires two samples later, on the
+  flank). Reaching 3 ms events means fixing that first, then re-deriving
+  `DET_MAX_SLOPE`, and re-running this table - the count in the last column is what
+  makes it a change to the detector and not a knob turn.
 * **`DET_K_ON` / `DET_K_OFF` / `DET_SIGMA_FLOOR`** — read `sigma=` off the log; the
   dither *and* the impulses give a real, non-zero noise floor to gate on (≈25 counts
   at ±10 V with the defaults).
-* **`DET_MIN_MAX_VALUE`, `DET_MAX_SLOPE`, `DET_MIN_WIDTH_SAMPLES`** — the glitches and
-  the impulses are there to show false-peak rejection in action; if one comes back
-  `VALID`, the bound that should have caught it is too loose. Note that once
-  `k_on * sigma` reaches `DET_MIN_MAX_VALUE` (5 × 25 ≈ 125 counts with the defaults)
-  the `MAX_TOO_SMALL` bound can no longer fire: anything that trips the threshold is
-  already above it. A 3-6 sample rectangle of ≤600 counts is genuinely ambiguous -
-  none of the metric bounds can tell it from a narrow real peak.
-* **`DET_BASELINE_ALPHA` / `DET_NOISE_ALPHA` / `DET_WARMUP_SAMPLES`** are per-sample
-  and therefore depend on the sample rate: at 10 kSPS, `0.001` ≈ a 1 s time
-  constant and `warmup_samples = 3000` ≈ 0.3 s.
-* **Sample rate** — `SORTER_SAMPLE_RATE_HZ` (10 kSPS) sets the pacing. Do not raise
-  it much without re-checking the narrow spikes: the AD7606 analog front end needs
-  a few µs to settle, so faster sampling smears the 1-4 sample impulses (and glitches)
-  until they no longer look like spikes.
+* **`DET_MIN_MAX_VALUE`, `DET_MIN_WIDTH_SAMPLES`, `DET_MIN_RISE_SAMPLES` /
+  `DET_MAX_SLOPE`** — the bounds and the shape guards. The glitches are there to show
+  false-peak rejection in action; if one comes back `VALID`, the guard that should have
+  caught it is too loose. A rectangular glitch is now dealt with twice over: anything
+  that does not survive `DET_MIN_RISE_SAMPLES` (2 ms) is *suppressed* before it is ever
+  an event, and a longer one that reaches an apex within 2 ms of its crossing is
+  reported as `rejected SHORT_FOR_HEIGHT`. `DET_MIN_MAX_VALUE` is checked once more
+  just before reporting, so a dither excursion that survived the rise test but never
+  reached it is suppressed too rather than filling the log with `MAX_TOO_SMALL`.
+  The one measurement detail worth knowing: the height and the area come from the
+  slope-bounded path, and an apex that the *signal* jumped to (more than
+  `DET_MAX_SLOPE` ahead of the path) is `SHORT_FOR_HEIGHT` - that is what tells a burst
+  of impulses apart from a pulse, and a spike on the *front* of a real peak costs that
+  peak nothing because its own apex arrives later.
+* **`DET_IMPULSE_FILTER_TAPS`** — how many samples wide a noise spike may be and
+  still be removed before the detector sees it: `1` = off, `3` = a 1-sample spike
+  (what `SPIKE_PCT` produces), `5` = up to 2 samples, `7` = up to 3 (the default),
+  `9` = up to 4 - the maximum. Raising it costs another sample of delay and blunts
+  anything that narrow - which for this signal is exactly what should happen, and
+  for real EMI spikes, or for a smeared impulse after a slower sample rate, is the
+  knob to reach for. The default is 7 because a spike that the DAC and the AD7606
+  front end have spread over three samples is what a 3-tap median misses.
+  `test/test_bench_detect.exe --sweep` prints the lengths side by side (the
+  `spikeMax` column is the number of events whose `max=` is a spike, and since the
+  waveform carries needles the table also sweeps `DET_MIN_RISE_SAMPLES` /
+  `DET_MIN_WIDTH_SAMPLES` - the two bounds a narrow event meets first). The audit of
+  record is `test/test_bench_detect.cpp` itself: `--peaks` prints the model's truth
+  against the firmware's verdict span by span, and `--min-rise N` / `--min-width N`
+  re-run the whole thing with a candidate bound, so no recompile is needed to ask
+  "what would 3 ms events cost?" - see "Tuning with the bench test".
+
+  One trade-off to know about: the start threshold is `5σ` **of the filtered
+  stream**, and a longer median lowers that `σ`, so on a quiet channel the threshold
+  falls with it. Measured on a synthetic channel whose only noise is 5 counts per
+  sample: `σ` 3.5 → 2.3 counts from taps 3 → 7, i.e. the threshold drops from ~17 to
+  ~12 counts. A 13-count noise bump can then start a rise candidate - and that is all
+  it can do: it does not survive the rise test (2 ms) and it never reaches
+  `DET_MIN_MAX_VALUE`, so it is suppressed and costs nothing on the link - not even a
+  log line. Read the reference the detector actually seeded with
+  `test/test_bench_detect.exe --peaks` (`EventDetector::baseline()` / `sigma()`);
+  on the bench waveform `sigma` is not one number but a range - over a 12-cycle run it
+  seeds at 13.3 counts when the quiet period ends (so the `k_on = 5` trigger opens at
+  `+67`) and then runs from 8.3 to 25.5 counts, i.e. the trigger from `+42` to `+128` -
+  and `base=` *follows* the drift instead of sitting still (5421 counts when the quiet
+  period ends, 5027 at the end of 12 cycles, the `BASELINE_WAVE_*` wander tracked
+  without inventing a single event). The dither is `±42` counts raw (`sigma` ~24, 27.9
+  as the run reports it for the *events*), but the detector gates the *median-filtered*
+  stream, so the level it triggers on sits below the raw-noise figure - which is why
+  `DET_MIN_MAX_VALUE` (80 counts) and the rise test matter as much as `DET_K_ON` does
+  when judging a weak peak.
+
+  **How small a peak can it see?** Measured, not argued: the bench's own detector
+  stack (aggregator + detector, the headers the M4 runs) fed *one* raised cosine at a
+  time on the generator's own dither, with a fresh quiet period per run (±10 V,
+  `sigma` 10.4..11.9 counts after the quiet period, trigger `+52..59`). The smallest
+  apex that comes back `VALID`:
+
+  | width (samples) | 30-50 (3-5 ms) | 60 (6 ms) | 80 (8 ms) | 100 (10 ms) | 150-1200 (15-120 ms) | 2400 (240 ms) |
+  |---|---|---|---|---|---|---|
+  | smallest VALID apex (counts) | never | 140 | 100 | 60 | 70-100 | 80 |
+  | same, at ±10 V (mV) | - | 43 | 31 | 19 | 22-31 | 25 |
+  | what sets the limit | the rise test: no edge can last 20 samples | rise test + `DET_MAX_SLOPE` | `DET_MAX_SLOPE` | `DET_MIN_MAX_VALUE` on the reported max | the same, plus the tracker at the wide end | the baseline tracker |
+
+  Read it as the *shape* of the floor, because that is what the bounds are:
+
+  * the first check is the **trigger**: a pulse has to cross `base + k_on*sigma`
+    (measured `+52..59` counts here; `+122` against the *raw* dither sigma the bench's
+    ground truth uses) - but at these noise levels `DET_MIN_MAX_VALUE` (80 counts) is what
+    decides the wide columns, because the excursion that crossed the trigger is only
+    *reported* if its own max reaches 80 and a drawn apex has to be about 60-70 counts for
+    the dither on it to get there;
+  * below ~4.8 ms (48 samples) **no amplitude is enough**: a raised cosine of width
+    `w` crosses a trigger `t` with an edge of `(w/2)*(1 - acos(1 - 2t/a)/pi)`
+    samples, so `w <= 2*DET_MIN_RISE_SAMPLES` has no solution at any apex. Just above
+    it the edge still needs a *tall* pulse - `DET_MAX_SLOPE` caps `apex / rise` - which
+    is why the 4.6 ms needle at 3293 counts is `rejected SHORT_FOR_HEIGHT`;
+  * a *wide* faint pulse is not automatically easier, but the reason is the
+    *reference*, not the width: the trigger is a multiple of the run's own sigma.
+    Measured with `--ladder`, 4 cycles, shipped front end: 1545 samples takes 70 counts
+    and up (sigma 11.9 → on +59; 30 and 50 come back "never crossed the on-threshold"),
+    while the same width asked for as four rungs 212..272 (sigma 10.4 → on +52) is
+    `VALID` at every one - window 1180..1228 samples, duration 1413..1493 of the 1545
+    drawn. At 907 samples it is the same story: four rungs 335..395 all `VALID` (windows
+    730..786, durations 850..912), and the 30..160 walk-up puts the floor between 60 and
+    70 counts. What a faint rung must not do is decide that sigma for itself: the
+    reference stops refreshing its *noise* estimate while a window is open
+    (`EventDetector::updateBaseline`), because a rung whose own flank is inside the gate
+    otherwise lifts its trigger as it rises (measured at 600 samples: sigma 13.5 → 19.2
+    counts across one 60-count rung, the trigger +68 → +96, above that rung's own apex).
+    The tracker still takes the floor over at the very wide end (2400 samples: the
+    baseline follows the pulse), and that corner is why `SIGNALGEN_FRONTIER_WIDTH_MAX`
+    stops at 80 ms - known gap, not documented behaviour;
+  * the numbers do **not** fall smoothly with width: the edge the detector measures is
+    read on a *filtered, slope-bounded* path, so it steps by several samples near the
+    boundary (measured: 15 → 21 samples between two neighbouring amplitudes at a width
+    of 80, and 1 → 22 at 100). The floor is a staircase, not a curve - which is why
+    8 ms needs a *taller* pulse than 6 ms. Read the per-span `--peaks` table rather
+    than extrapolating a formula;
+  * `test_bench_detect --peaks` prints the truth *and* the verdict for every span, so
+    any of these can be re-measured on the spot: the `small peaks:` line in its report
+    is how many of them a run actually contained.
+
+  **Can I see it?** The table above is a measurement, and the random train cannot show
+  it - its small apexes are shoulders on taller neighbours, on a pane scaled to the whole
+  DAC range. `SIGNALGEN_LADDER = 1` (or the harness's `--ladder`, the viewer's
+  `--sim-ladder`) replaces the train with the staircase the question is about: isolated
+  pulses of *one* width, apexes stepping by a known amount, nothing else drawn - no
+  random pulses, no glitches, no impulses, so the pane's own scale settles on the ladder
+  and each rung stands on the baseline instead of in the dither. Measured with the
+  shipped numbers (12 rungs 20…460 counts at 600 samples = 60 ms):
+
+  ```powershell
+  py -3 test\live_plot.py --sim --sim-ladder          # the staircase, drawn live
+  test\test_bench_detect.exe --ladder                 # the same run, rung by rung
+  test\test_bench_detect.exe --ladder --ladder-width 100 --ladder-step 10
+  ```
+
+  * at 600 samples the first rung the detector takes is **100 counts** (60 and 20 stay
+    silent), and the edge *moves with the staircase*: refined with `--ladder-step 10` from
+    20 it lands at 70 (60 silent), started at 40 it lands at 80 (70 silent). So "the floor
+    at 60 ms" is a **band** of 60-100 counts, not a number - a borderline apex is decided
+    by the dither that lands on it - and the table above rounds that column up to 80,
+    inside the band;
+  * walking the width reproduces the table's shape: 40 samples (4 ms) takes **nothing** at
+    any height, 100 (10 ms) takes 140, 200 (20 ms) takes 100 - and the run says "no claim
+    on the pinnacle" instead of failing when the width is one the rise test can never
+    accept;
+  * the ladder has one caveat of its own, and it is the tracker again: a slot has to be
+    long against `1/DET_BASELINE_ALPHA` (1000 samples) or the baseline never gets back to
+    the true level between two rungs and every apex measures short. A 1200-sample rung at
+    12 rungs/cycle leaves 466 samples of baseline and reads a floor of 380-420 counts; the
+    same rungs at `--ladder-count 4` (5000-sample slots) read 60-100, which is the table's
+    own 150-1200 column. `--ladder-count` is how you give the tracker the time a wide
+    rung needs; a rung wider than its own slot cannot be drawn at all, and the run says so
+    (and fails) rather than reporting a floor it did not measure.
+
+  At the widest front end modelled (`--frontend 4`, where the DAC/ADC path smears an
+  impulse over four samples) a 7-tap median can no longer reach the spike. Nothing is
+  measured wrongly - the spike is still clipped out of the height - but if one lands
+  on a peak's *apex* the event is reported as `rejected SHORT_FOR_HEIGHT` (12 cycles:
+  124 VALID of 136 events, 4 rejected) instead of being measured, and if one lands
+  clear of every pulse its `+750`-count step can outlive the rise test and be reported
+  as a peak of its own (1 false accept in the same run). `taps=9` clears the false
+  accept and all but one of the rejections (126 VALID, 1 rejected, 0 ghost), and it
+  is the one to reach for when the front end or the sample rate makes the spike wider
+  than three samples. `--sweep` prints that grid; the table in `config.h`'s
+  `DET_IMPULSE_FILTER_TAPS` note is the reading of it.
+* **`DET_BASELINE_ALPHA` / `DET_NOISE_ALPHA` / `DET_QUIET_SAMPLES`** are per-sample and
+  therefore depend on the sample rate: at 10 kSPS, `0.001` ≈ a 1 s time constant and
+  `DET_QUIET_SAMPLES = 3000` ≈ 0.3 s. `DET_QUIET_SEED_POINTS` says how many of those
+  samples seed the reference (spread over the whole period) and `DET_DIP_TOLERANCE`
+  how long a dip inside the rise test may last.
+* **Sample rate** — `SORTER_SAMPLE_RATE_HZ` (10 kSPS) sets the pacing. The detector's
+  per-sample constants (`DET_BASELINE_ALPHA`, `DET_NOISE_ALPHA`, `DET_QUIET_SAMPLES`)
+  and the sample-counted ones (`DET_MIN_WIDTH_SAMPLES`, `DET_MIN_RISE_SAMPLES`,
+  `DET_IMPULSE_FILTER_TAPS`) all shift meaning with it, and so does the AD7606 analog
+  front end: it needs a few µs to settle, so faster sampling smears an impulse over
+  more samples. Raising the rate therefore means re-checking the impulse filter in
+  particular - an EMI spike that is 1-2 samples at 10 kSPS could be 5 at 50 kSPS, and
+  `DET_IMPULSE_FILTER_TAPS` only goes to 9.
 * Both DAC channels always output the same waveform, and a new random train is drawn
   at the start of every pattern cycle.
 

@@ -7,7 +7,7 @@ The M4 fills sample frames continuously (stream_sink.h); the M7 prints them as o
 line per point once streaming has been switched on, and stays quiet otherwise, so
 the ordinary event log stays readable:
 
-    STREAM on: decim=10 chans=0,1 wf=1 points=64
+    STREAM on: decim=10 chans=0,1 wf=1 points=64 minw=35
     S,<sample index>,<gen code>,<ch>:<count>,<ch>:<count>,...
 
 This script is that host.  It sends "T1" - the serial monitor's stream-on command,
@@ -16,18 +16,49 @@ a small web page over Server-Sent Events, which draws a rolling window of the
 traces in the browser.  Pure Python stdlib plus a browser: no pyserial, no npm, no
 build step.
 
-    py -3 test/live_plot.py --sim              # no board: signal_model.py generates
+    py -3 test/live_plot.py --sim              # no board: the bench harness runs
     py -3 test/live_plot.py --port COM7        # the real board
-    py -3 test/live_plot.py --sim --window 2 --http-port 9000
+    py -3 test/live_plot.py --stdin < bench.txt    # a capture, or a pipe
 
---sim ticks the Python mirror of the bench waveform (test/signal_model.py) at the
-same 10 kSPS the firmware uses, feeds the detector mirror from model_check.py and
-emits the very same `S,` lines the board would, so the viewer can be exercised
-with nothing plugged in.  Its "measured" columns are that waveform as the AD7606
-would digitize it (DAC volts -> counts for the selected RANGE strap, plus a little
-ADC noise), and its event log comes from the real detector mirror.  Sampling is
-wall-clock paced at the firmware's 10 kSPS (`--sim-speed N` asks for N times real
-time and `0` for no pacing at all, handy for filling a small window quickly).
+--sim runs the firmware without a board.  It starts test/test_bench_detect.exe
+(built by test/run_tests.ps1) with --stream, which makes the *shipped*
+EventAggregator and EventDetector run over signal_model.h's bench waveform and
+print the board's own serial text for that run - the `STREAM on:` header, the `S,`
+points and printBundle()'s event lines - then replays that text at 10 kSPS through
+the very parser the COM port feeds.  The page therefore draws the firmware's
+decisions over the samples they were made on, not a model of them: there is no
+Python mirror anywhere in this path.  Everything the harness prints, its own
+verdict included, lands in the log pane.
+
+That capture belongs to one *build* of the harness: the log pane names the build it
+came from (and says so when the exe is older than the sources it was compiled from),
+and rebuilding test_bench_detect.exe while the viewer runs replays the new capture
+with the sample indices continuing, instead of leaving the previous waveform on
+screen.  That is the usual answer to "the page does not show the updated test
+signal" - the other being a board whose firmware was not re-flashed.
+
+    py -3 test/live_plot.py --sim --sim-cycles 6 --sim-speed 2 --window 2
+    py -3 test/live_plot.py --sim --sim-start live     # the board's boot reality
+    py -3 test/live_plot.py --sim --sim-ladder         # the floor ladder: small peaks
+
+--sim-ladder runs the harness's *floor ladder* instead of the random train
+(SIGNALGEN_LADDER_* in config.h): a staircase of isolated pulses whose apexes step up
+from inside the noise band, one per slot of the cycle, with no random pulses, glitches
+or impulses drawn at all.  It is the one bench pattern whose small apexes the pane's own
+vertical scale can show - the random train's span the whole DAC range (~10000 counts),
+so a few-hundred-count apex lands in the dither there, and its gaps are 3..90 ms against
+120 ms pulses, which leaves such an apex a shoulder on a neighbour rather than a peak.
+With the ladder the pane settles near 1000 counts (0.37 px per count): the noise band is
++/-15 px, a 100-count rung 37 px, the 460-count pinnacle 169 px - so "how close to the
+baseline can a peak be and still be detected" is something to *look at*.  The same run
+prints as a table with `test/test_bench_detect.exe --ladder` (rung by rung, with the
+reported max= and the floor between the last two rungs), and its --ladder-width /
+--ladder-min / --ladder-step / --ladder-count flags move the staircase - pipe its
+--stream into `--stdin` for a width the viewer has no flag for.
+
+--sim-speed N replays the capture at N times real time and `0` replays it as fast
+as Python can (handy for filling a small window); the capture itself is always
+produced as fast as the host manages, so the pacing is this script's choice.
 
 The page shows
 
@@ -43,11 +74,26 @@ The page shows
     peak it reported on top of that baseline, coloured by the verdict - so a pulse
     buried in noise, or two pulses merged into one window, can be judged against the
     same numbers the log prints (`detector overlay` unticks it),
-  * the two things those lines cannot show, read back off the plotted points and
+  * the width floor that decision was measured against, drawn on the window itself: a
+    band `minw=` samples wide centred on the window (3.5 ms of *duration* at the
+    defaults) is the shortest event the detector accepts, so a `w=27smp` tag can be
+    *seen* to be under it instead of only being reported as too narrow.  The duration is
+    what the floor is about, so the page draws the width each window was judged with as a
+    rule of its own, coloured by the *width* question alone: green while it cleared the
+    band, orange only when the floor is what refused the window.  A window refused on the
+    shape bounds instead (a needle, `rej SHORT_FOR_HEIGHT`) carries a duration well over
+    the band, and painting that rule in the rejection colour is what made a rise rejection
+    read as a width one.  The
+    number travels in the STREAM header, printed by the board, so the drawing cannot
+    drift from the firmware it is drawing; a header without it (an older build piped in
+    with --stdin) draws no floor,
+  * the three things those lines cannot show, read back off the plotted points and
     tagged in colours of their own: `2 peaks  dip +58` when one window swallowed two
-    peaks, and `!max` / `?max` when the window's own samples do not reach the max it
-    reported (an impulse the decimation dropped, most often).  Both describe the
-    trace, never replace the measured numbers - see *Live sample stream* below.
+    peaks, `!max` / `?max` when the window's own samples do not reach the max it
+    reported (an impulse the decimation dropped, most often), and `!rise <=1ms` when
+    the trace climbs to its peak faster than a bead's own edge - the shape of a spike,
+    not a dome.  All three describe the trace, never replace the measured numbers - see
+    *Live sample stream* below.
   * a text pane with everything the board prints that is not a sample line: the
     STREAM metadata line, the boot banner and every closed event with its verdict,
     so a run can be read back afterwards.
@@ -67,15 +113,13 @@ import math
 import os
 import queue
 import re
+import shutil
+import subprocess
 import sys
 import threading
 import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import model_check as mc           # noqa: E402  (detector mirror, for --sim)
-import signal_model as sm          # noqa: E402  (waveform mirror of signal_model.h)
 
 # --- constants mirrored from config.h ---------------------------------------
 SAMPLE_RATE_HZ = 10000             # SORTER_SAMPLE_RATE_HZ
@@ -108,29 +152,25 @@ DAC_MAX_CODE = 4095
 DAC_VREF     = 3.3
 AD7606_FULL_SCALE_COUNTS = 32768
 
-# Where the simulated measured channels get their noise from: in the +/-10 V strap
-# one AD7606 count is ~0.3 mV, so a couple of counts keeps the detector mirror
-# honest without hiding the signal.
-SIM_ADC_NOISE = 2.0
-SIM_SEED      = 0x5EED1234
+# Where the bench harness puts its build (test/run_tests.ps1) and the two ways
+# running it can fail loudly enough to be worth translating for the reader.
+BENCH_EXE           = 'test_bench_detect.exe'
+BENCH_CYCLE_SAMPLES = 20000        # SIGNALGEN_CYCLE_SAMPLES in config.h
+BENCH_EXIT_DLL      = -1073741515  # 0xC0000135: its C++ runtime is not on PATH
 
-# --sim paces itself in wall-clock time, but a Windows timer tick is ~1 ms, so
-# sleeping once per sample would crawl; sleep only when this far ahead instead.
+# --sim and --stdin pace themselves in wall-clock time, but a Windows timer tick is
+# ~1 ms, so sleeping once per point would crawl; sleep only when this far ahead
+# instead.  (The pacer re-bases after a long stall rather than trying to pay back a
+# debt it can never pay off.)
 PACE_MIN_SLEEP = 0.004
+PACE_REBASE    = -0.05
 
 TRACE_COLORS = ['#c62828', '#2e7d32', '#f9a825', '#6a1b9a',
                 '#00838f', '#4e342e', '#ad1457', '#37474f']
 
-# PeakRejectReason names, spelled the way the M7 prints them (reasonName()).
-REASON_NAME = {
-    mc.REASON_OK:               'OK',
-    mc.REASON_MAX_TOO_SMALL:    'MAX_TOO_SMALL',
-    mc.REASON_WIDTH_TOO_NARROW: 'WIDTH_TOO_NARROW',
-    mc.REASON_WIDTH_TOO_WIDE:   'WIDTH_TOO_WIDE',
-    mc.REASON_AREA_TOO_SMALL:   'AREA_TOO_SMALL',
-    mc.REASON_SHORT_FOR_HEIGHT: 'SHORT_FOR_HEIGHT',
-    mc.REASON_RAILED:           'RAILED',
-}
+# The verdict names are *not* mirrored here any more: the event lines carry the name
+# the firmware's own reasonName() printed, and the page shows that word (see _event()
+# below).  A table of enum values in this file could only ever disagree with it.
 
 # printBundle() in sorter-firmware.ino: the two lines a closed event prints.  The
 # head carries the window and the verdict, the channel line the numbers behind it.
@@ -188,14 +228,19 @@ class StreamState:
             self.meta = kw
         self.publish(dict(kw, kind='meta'))
 
-    def add_batch(self, first_index, gen, adc):
-        """One frame: gen = DAC codes, adc = [[count, ...], ...] per channel."""
+    def add_batch(self, first_index, gen, adc, step=DECIM):
+        """One frame: gen = DAC codes, adc = [[count, ...], ...] per channel.
+
+        `step` is how many raw samples one point covers - the decimation the header
+        announced, not this file's default, so a board (or a harness run) that
+        streams at another decimation still lands on the right sample indices.
+        """
         n = len(gen)
         with self.lock:
             self.points += n
             self.frames += 1
             for k in range(n):
-                self.recent.append((first_index + k * DECIM, gen[k],
+                self.recent.append((first_index + k * step, gen[k],
                                     [ch[k] for ch in adc]))
         self.publish({'kind': 'data', 'i': first_index, 'n': n,
                       'gen': gen, 'adc': adc})
@@ -258,10 +303,18 @@ class StreamParser:
 
     Three line shapes matter to the page:
 
-        STREAM on: decim=10 chans=0,1 wf=1 points=64      metadata (sent by `T`)
+        STREAM on: decim=10 chans=0,1 wf=1 points=64 minw=35  metadata (sent by `T`)
         S,<sample index>,<gen code>,<ch>:<count>,...      one sample point
         Event #12  VALID  reason=0 OK  window=...         a closed event, plus
           ch0  max=...  area=...  width=...  base=...       its per-channel line
+
+    `minw=` is the detector's floor on the event's *duration*, in samples (config.h's
+    DET_MIN_WIDTH_SAMPLES): the page draws it over every window it overlays as a band
+    centred on the window and states it beside the point rate, so what a window was
+    judged against is on screen - and it is the board that says so.  The per-channel
+    `width=` on the event line is that same quantity for that event (the duration the
+    detector estimated), while the head line's `window=` is the excursion the measurement
+    covered.
 
     Points are collected until a whole frame is in - the M7 prints a frame's points
     back to back, so either a contiguous sample index or SORTER_STREAM_POINTS
@@ -284,6 +337,7 @@ class StreamParser:
         self.decim    = DECIM
         self.channels = []
         self.wf       = 0
+        self.min_width_samples = 0             # the header's minw=: the judged floor
         self.pending  = None                  # Event # head waiting for its ch line
         self.sample_rate = SAMPLE_RATE_HZ      # events arrive in us; traces count samples
 
@@ -401,11 +455,20 @@ class StreamParser:
 
         self.decim    = int(fields.get('decim', self.decim))
         self.wf       = int(fields.get('wf', 0))
+        # The judged width floor, straight from the board (config.h's
+        # DET_MIN_WIDTH_SAMPLES): a floor on the event's *duration*, in samples.  0 when
+        # the line came from a build that does not print it: the page then draws no floor
+        # rather than a guessed one.
+        try:
+            self.min_width_samples = int(fields.get('minw', 0))
+        except ValueError:
+            self.min_width_samples = 0
         self.channels = [int(c) for c in fields.get('chans', '').split(',')
                          if c.strip().isdigit()]
         self.state.set_meta(source=self.source, streaming=stream_on,
                             decim=self.decim, channels=self.channels, wf=self.wf,
                             points=int(fields.get('points', POINTS)),
+                            min_width=self.min_width_samples,
                             sample_rate=SAMPLE_RATE_HZ, range=self.range_v,
                             gen_scale=gen_scale_counts(self.range_v),
                             window_s=self.state.window_sec,
@@ -438,7 +501,7 @@ class StreamParser:
 
     def flush(self):
         if self.gen:
-            self.state.add_batch(self.frame_i, self.gen, self.cols)
+            self.state.add_batch(self.frame_i, self.gen, self.cols, self.decim)
         self.gen, self.cols, self.frame_i, self.last_i = [], [], None, None
 
 
@@ -511,125 +574,402 @@ class SerialSource:
             self.thread.join(timeout=1.5)
 
 
-class SimSource:
-    """No board: signal_model.py generates the waveform and prints the same lines.
+def default_bench_exe():
+    """The bench harness test/run_tests.ps1 builds, next to this script."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    exe  = os.path.join(here, BENCH_EXE)
+    if not os.path.exists(exe):
+        bare = exe[:-4] if exe.endswith('.exe') else exe    # a Unix build has no .exe
+        if os.path.exists(bare):
+            return bare
+    return exe
 
-    The samples go through the very same text protocol as the board's (they are
-    built and re-parsed, so the parser is exercised too), but paced by this host
-    rather than by the M4's own timer.  The measured columns are the generated
-    waveform as the AD7606 would digitize it, and the detector mirror runs at the
-    full sample rate on channel 0, so the log pane fills with the event lines the M7
-    would print.
+
+def bench_runtime_dirs():
+    """The folders that hold the harness's C++ runtime, if it is not on PATH.
+
+    run_tests.ps1 builds test_bench_detect.exe with MinGW g++ (or clang++), and that
+    links libstdc++-6.dll / libgcc_s_*.dll *dynamically*: the exe only starts when the
+    compiler's own bin folder is on PATH, which is why run_tests.ps1 prepends it for
+    its runs.  The WinLibs package winget installs is not added to PATH by its
+    installer, so --sim would otherwise fail with a bare 0xC0000135 on the very
+    machines the bench is built on.  The same fallbacks as the test runner, in the
+    same order, so both agree on which compiler is "the" one.
+    """
+    if os.name != 'nt':
+        return []                       # every Unix build finds its libs itself
+    found = []
+    for name in ('g++.exe', 'clang++.exe'):
+        exe = shutil.which(name)
+        if exe:
+            found.append(os.path.dirname(exe))
+    winget = os.path.join(os.environ.get('LOCALAPPDATA', ''),
+                          'Microsoft', 'WinGet', 'Packages')
+    if os.path.isdir(winget):
+        for root, _dirs, files in os.walk(winget):
+            if 'g++.exe' in files:
+                found.append(root)
+                break
+    for exe in (r'C:\msys64\mingw64\bin\g++.exe', r'C:\mingw64\bin\g++.exe',
+                r'C:\ProgramData\mingw64\bin\g++.exe'):
+        if os.path.exists(exe):
+            found.append(os.path.dirname(exe))
+    return found
+
+
+# What the harness is compiled from: test/run_tests.ps1 builds test_bench_detect.cpp
+# plus the repo headers it pulls in.  Deliberately *not* in the list: config.h - the
+# harness mirrors the SIGNALGEN_* numbers from it by hand (its "bench build, mirrored
+# from config.h" block), so the waveform a --sim page draws is the waveform baked into
+# the exe, and editing config.h alone does not move it.
+BENCH_SOURCES = ['test_bench_detect.cpp',
+                 os.path.join('..', 'signal_model.h'),
+                 os.path.join('..', 'event_aggregator.h'),
+                 os.path.join('..', 'event_detector.h'),
+                 os.path.join('..', 'peak_metrics.h')]
+
+
+def bench_newer_sources(exe):
+    """Harness sources newer than the harness itself, newest first.
+
+    --sim draws a *built* harness, and a stale exe replays the previous waveform with
+    nothing on screen to say so - the one way "the page does not show the updated
+    signal" happens without anything actually being broken.  Naming the files turns
+    that into a rebuild (`test/run_tests.ps1`) instead of a hunt.
+    """
+    try:
+        built = os.path.getmtime(exe)
+    except OSError:
+        return []
+    here = os.path.dirname(exe) or '.'
+    newer = []
+    for rel in BENCH_SOURCES:
+        try:
+            mt = os.path.getmtime(os.path.join(here, rel))
+        except OSError:
+            continue
+        if mt > built + 1.0:        # an edit and its rebuild land in the same second
+            newer.append((mt, os.path.basename(rel)))
+    return [name for _, name in sorted(newer, reverse=True)]
+
+
+class FirmwareSource:
+    """No board: the firmware's own bench harness prints the very same lines.
+
+    test/test_bench_detect.exe runs the shipped EventAggregator and EventDetector -
+    the headers the M4 compiles - over signal_model.h's waveform, and ``--stream``
+    makes it print the M7's serial text for that run: the `STREAM on:` header, one
+    `S,` line per stream point and printBundle()'s two lines per closed event.  This
+    class runs it once, then replays that text at 10 kSPS through the same
+    StreamParser the COM port feeds, so what the overlay draws is the firmware's own
+    verdict on the samples it was given.  Nothing is interpreted here: text in, text
+    out - which is the point, because the mirror this replaced had drifted away from
+    the firmware, and a drifted mirror is worse than no view at all.
+
+    The harness's verdict (its counters, and any check it failed) comes back on
+    stderr and is copied to the log pane, so `14 event(s) (14 VALID), 0 missed, ...`
+    can be read in the browser next to the peaks it is talking about.
+
+    A capture is one build's worth of text: the harness runs when this source starts
+    and is replayed from then on.  Rebuilding test_bench_detect.exe while the viewer
+    runs is therefore picked up here rather than ignored - the new capture is replayed
+    with its sample indices continuing where the last one stopped, so the page never
+    has to be restarted to show a changed waveform - and the build actually on screen
+    is named in the log pane, a stale exe older than its sources included.
     """
 
-    def __init__(self, state, range_v, speed=1.0, channels=CHANNELS, seed=None):
-        overrides = {'seed': seed} if seed is not None else {}
+    def __init__(self, state, range_v, speed=1.0, seed=None, exe=None, cycles=4,
+                 frontend=None, start=None, hw=False, repeat=False, decim=DECIM,
+                 echo=True, ladder=False):
+        self.state      = state
+        self.range_v    = range_v
+        self.speed      = speed
+        self.seed       = seed
+        self.exe        = exe or default_bench_exe()
+        self.cycles     = max(int(cycles), 2)   # the harness clamps to >= 2 cycles
+        self.frontend   = frontend              # None = the harness's default (3 taps)
+        self.start_mode = start                 # None = hold, the detector's contract
+        self.hw         = hw
+        self.repeat     = repeat
+        self.ladder     = ladder                # --sim-ladder: SIGNALGEN_LADDER_*
+        self.decim      = max(int(decim), 1)
+        self.parser     = StreamParser(state, 'bench', range_v, echo=echo)
+        self.thread     = None
+        self.stopped    = threading.Event()
+        self.lines      = []
+        self.stamp      = self._exe_stamp()   # the build the capture in hand came from
+
+    def argv(self):
+        """The harness command line this run is fed by (logged, so a review is
+        reproducible)."""
+        argv = [self.exe, '--stream', '--cycles', str(self.cycles),
+                '--stream-decim', str(self.decim)]
+        if self.ladder:
+            # SIGNALGEN_LADDER_* (config.h): the staircase of isolated, near-baseline
+            # peaks, instead of the random train - the one pattern whose small apexes
+            # the pane's own scale can show.  A different width or a finer staircase is
+            # the harness's own flags:  test_bench_detect.exe --ladder --ladder-width
+            # 200 --stream | py -3 test/live_plot.py --stdin
+            argv.append('--ladder')
+        if self.frontend is not None:
+            argv += ['--frontend', str(int(self.frontend))]
+        if self.start_mode is not None:
+            argv += ['--start', self.start_mode]
+        if self.hw:
+            argv.append('--hw')
+        if self.seed is not None:
+            argv += ['--seed', '0x%X' % self.seed]
+        return argv
+
+    def start(self):
+        self._report_build()
+        self.lines = self._capture()
+        self.thread = threading.Thread(target=self._run, name='bench', daemon=True)
+        self.thread.start()
+
+    def _report_build(self):
+        """Name the harness build this page is drawing - and say if it is stale.
+
+        The page cannot tell one build from another, so a viewer started against an exe
+        built before the last edit replays the previous waveform and simply looks
+        wrong.  One line in the log pane settles it.
+        """
+        try:
+            built = os.path.getmtime(self.exe)
+        except OSError:
+            return                      # a missing harness is _capture()'s to report
+        self.parser.log('bench: harness built %s (%s)'
+                        % (time.strftime('%Y-%m-%d %H:%M:%S',
+                                         time.localtime(built)),
+                           os.path.basename(self.exe)))
+        stale = bench_newer_sources(self.exe)
+        if stale:
+            self.parser.log('bench: !! %s is older than %s - this run draws the '
+                            'waveform baked into the exe, not the tree it was built '
+                            'from; rebuild with powershell -ExecutionPolicy Bypass '
+                            '-File test\\run_tests.ps1'
+                            % (os.path.basename(self.exe), ', '.join(stale)))
+
+    def _capture(self):
+        """Run the harness once, now: the board's own text, as --stream prints it."""
+        self.stamp = self._exe_stamp()      # a rebuild *during* the run counts too
+        argv = self.argv()
+        self.parser.log('bench: %s %s' % (os.path.basename(argv[0]),
+                                          ' '.join(argv[1:])))
+        if abs(self.range_v - 10.0) > 1e-9:
+            # The counts the harness prints come out of config.h's SIGNALGEN_ADC_PER_DAC
+            # (2.64 counts per DAC code in the +/-10 V strap); --range only scales this
+            # page's own overlay, so a mismatched value slides the expected waveform
+            # off the measured one.
+            self.parser.log('bench: note - --range %g V scales the page overlay only; '
+                            'the counts themselves come from config.h '
+                            '(SIGNALGEN_ADC_PER_DAC), which is set for +/-10 V'
+                            % self.range_v)
+        if not os.path.exists(self.exe):
+            raise FileNotFoundError(
+                '%s is missing - build the harness first: powershell '
+                '-ExecutionPolicy Bypass -File test\\run_tests.ps1' % self.exe)
+        env = dict(os.environ)
+        extra = [d for d in bench_runtime_dirs() if d not in env.get('PATH', '')]
+        if extra:
+            env['PATH'] = os.pathsep.join(extra + [env.get('PATH', '')])
+        proc = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              universal_newlines=True,
+                              cwd=os.path.dirname(self.exe) or None, env=env)
+        if proc.returncode == BENCH_EXIT_DLL:
+            raise OSError('the harness could not load its C++ runtime (0xC0000135): '
+                          "put the compiler's bin folder on PATH - run_tests.ps1 does "
+                          'that for its own runs')
+        if proc.returncode != 0:
+            raise OSError('the harness exited %d' % proc.returncode)
+        for line in proc.stderr.splitlines():       # the harness's own verdict
+            if line.strip():
+                self.parser.log('bench: ' + line.strip())
+        lines = [l for l in proc.stdout.splitlines() if l.strip()]
+        if not lines:
+            raise OSError('the harness printed nothing - is %s built from a source '
+                          'tree that has --stream?' % self.exe)
+        return lines
+
+    def _span(self):
+        """Samples in one pass of the capture: the last index plus one decimation.
+
+        --sim-repeat uses it to put the next pass further along the board's timeline
+        instead of rewinding it: a sample index that jumps *backwards* would flush
+        the open frame and drag the page's window with it.
+        """
+        last = 0
+        for line in self.lines:
+            if line.startswith('S,'):
+                try:
+                    last = max(last, int(line.split(',', 2)[1]))
+                except ValueError:
+                    continue
+        return last + self.decim
+
+    @staticmethod
+    def _shift(line, shift, shift_us):
+        """Move a verbatim board line onto a later pass's timeline (--sim-repeat)."""
+        if shift == 0:
+            return line
+        if line.startswith('S,'):
+            _, _, rest = line.partition(',')
+            index, _, tail = rest.partition(',')
+            return 'S,%d,%s' % (int(index) + shift, tail)
+        if line.startswith('Event #'):
+            return re.sub(r'window=(\d+)\.\.(\d+)us',
+                          lambda m: 'window=%d..%dus' % (int(m.group(1)) + shift_us,
+                                                         int(m.group(2)) + shift_us),
+                          line)
+        return line
+
+    def _run(self):
+        """Replay the harness's text at the board's own 10 kSPS.
+
+        The sample index in the `S,` lines is the clock, exactly as it is on the
+        board: `--sim-speed 1` means one second of waveform per second of wall clock,
+        and a capture can be replayed faster than the harness could ever produce it.
+        """
+        paced = self.speed > 0.0                    # --sim-speed 0 = flat out
+        span  = self._span()
+        shift = 0                                   # samples, 0 on the first pass
+        passes = 0
+
+        while not self.stopped.is_set():
+            t0 = time.time()
+            for line in self.lines:
+                if self.stopped.is_set():
+                    break
+                text = self._shift(line, shift, shift * DT_US)
+                if paced and text.startswith('S,'):
+                    # Pace on the *pass-local* index: the shift only keeps the board's
+                    # timeline moving forward for --sim-repeat, so pacing on the
+                    # absolute index would make every pass wait shift/rate seconds
+                    # before printing its first point - a hole in the page that grows
+                    # by one pass per loop.
+                    index = int(text.split(',', 2)[1]) - shift
+                    delay = (t0 + index / (SAMPLE_RATE_HZ * self.speed)
+                             - time.time())
+                    if delay > PACE_MIN_SLEEP:
+                        time.sleep(delay)
+                    elif delay < PACE_REBASE:       # a stalled host: re-base, do not
+                        t0 = time.time()            # try to pay the debt back
+                self.parser.feed_line(text)
+            passes += 1
+            if self.stopped.is_set():
+                break
+            if not self.repeat:
+                self.parser.log('bench: end of the capture - the page keeps the last '
+                                'window; Ctrl+C stops the viewer (--sim-repeat loops, '
+                                '--sim-cycles lengthens the run, and a rebuild of the '
+                                'harness is replayed here)')
+                if not self._watch_exe():
+                    break
+            elif not self._exe_changed(self.stamp):
+                shift += span
+                self.parser.log('bench: replaying the capture (pass %d, indices '
+                                'continue from %d)' % (passes, shift))
+                continue
+            # A rebuild: fetch the new capture.  The old one is deliberately *not*
+            # replayed while we wait - a sample index that jumps backwards would drag
+            # the page's window with it (the same reason --sim-repeat shifts).
+            lines = None
+            while lines is None and not self.stopped.is_set():
+                try:
+                    lines = self._capture()         # start()'s work, mid-session
+                except OSError as exc:
+                    self.parser.log('bench: the rebuilt harness did not run: %s' % exc)
+                    if not self._watch_exe():       # a half-written exe: wait it out
+                        break
+            if lines is None:
+                break
+            shift += span                       # past the samples already on screen
+            self.lines = lines
+            span = self._span()
+            self.parser.log('bench: the harness was rebuilt - replaying the new '
+                            'capture (indices continue from %d)' % shift)
+        self.parser.flush()
+
+    def _exe_stamp(self):
+        """The harness's timestamp, or None when it cannot be read."""
+        try:
+            return os.path.getmtime(self.exe)
+        except OSError:
+            return None
+
+    def _exe_changed(self, seen):
+        """True if the harness has been rebuilt since `seen` (None = cannot tell)."""
+        now = self._exe_stamp()
+        return now is not None and seen is not None and now != seen
+
+    def _watch_exe(self):
+        """Wait for a rebuild of the harness.  True if it happened, False if we stop.
+
+        Once the capture has been replayed the page is a still picture of a build that
+        no longer exists - which is what "the page does not show the updated test
+        signal" looks like when nothing is broken.  The exe's own timestamp closes that
+        gap without restarting the viewer, and an exe halfway through being written
+        just keeps us waiting.
+        """
+        while not self.stopped.wait(0.2):
+            if self._exe_changed(self.stamp):
+                return True
+        return False
+
+    def stop(self):
+        self.stopped.set()
+        if self.thread is not None:
+            self.thread.join(timeout=1.5)
+        self.parser.flush()
+
+
+class PipeSource:
+    """The board's text arriving on stdin: a capture, or another process's pipe.
+
+        py -3 test/live_plot.py --stdin < bench.txt
+        test\\test_bench_detect.exe --stream | py -3 test/live_plot.py --stdin
+
+    Nothing but the text protocol crosses the pipe, so this handles a file an
+    engineer saved from a monitor session exactly like a live run.  There is no pacing
+    here: whoever writes the lines decides the rate - `--stream` makes the harness write
+    them line-buffered, one at a time, so a piped run arrives as it is produced and the
+    viewer follows it.  A harness run is fast (a 4-cycle capture is 8 s of stream in
+    well under a second), so for watching it in real time use --sim, which replays the
+    same text at the board's own 10 kSPS; --stdin is the path for a capture or for a
+    board that is already printing.
+    """
+
+    def __init__(self, state, range_v, stream=None):
         self.state   = state
-        self.range_v = range_v
-        self.speed   = speed
-        self.nch     = channels
-        self.parser  = StreamParser(state, 'sim', range_v)
-        # --range selects the AD7606 RANGE strap, and the firmware's matching
-        # SIGNALGEN_ADC_PER_DAC has to be set the same way (2.64 at +/-10 V, 5.28 at
-        # +/-5 V - see config.h).  Mirror that here: the model works in counts per
-        # DAC code, so with the wrong factor a +/-5 V run would report every peak at
-        # twice its programmed height.
-        self.model   = sm.SignalModel(adc_per_dac=gen_scale_counts(range_v),
-                                      **overrides)
-        self.det     = mc.EventDetector(mc.Config())
-        self.dither  = sm.SignalModel(seed=SIM_SEED)   # only for its Gaussian noise
+        self.parser  = StreamParser(state, 'stdin', range_v)
+        self.stream  = stream if stream is not None else sys.stdin
         self.thread  = None
         self.stopped = threading.Event()
 
     def start(self):
-        self.parser.log('sim: waveform mirror signal_model.py, seed 0x%X, '
-                        '%d-sample cycle (%.1f s)'
-                        % (self.model.seed, self.model.cycle_samples,
-                           self.model.cycle_samples / float(SAMPLE_RATE_HZ)))
-        self.parser.log('sim: DAC -> AD7606 loopback at +/-%g V, %d measured channel(s)'
-                        % (self.range_v, self.nch))
-        self.parser.feed_line('STREAM on: decim=%d chans=%s wf=1 points=%d'
-                              % (DECIM, ','.join(str(c) for c in range(self.nch)),
-                                 POINTS))
-        self.thread = threading.Thread(target=self._run, name='sim', daemon=True)
+        self.thread = threading.Thread(target=self._run, name='stdin', daemon=True)
         self.thread.start()
-
-    def _counts(self, code):
-        """What each AD7606 reports for this DAC code, plus a little ADC noise.
-
-        Box-Muller gives two independent normals per call, so one call covers the
-        usual two channels.
-        """
-        base = volts_to_counts(code * DAC_VREF / DAC_MAX_CODE, self.range_v)
-        noise = []
-        while len(noise) < self.nch:
-            noise.extend(self.dither._gauss_pair())
-        return [base + int(round(noise[c] * SIM_ADC_NOISE))
-                for c in range(self.nch)]
+        return self
 
     def _run(self):
-        paced  = self.speed > 0.0               # --sim-speed 0 = run flat out
-        dt     = 1.0 / (SAMPLE_RATE_HZ * self.speed) if paced else 0.0
-        next_t = time.time()
-        frame  = []                      # (index, code, counts) of the open frame
-        sample = 0
-
+        # Read the raw bytes in small chunks: a buffered text iterator would sit on
+        # the first few kilobytes, and a live review has to see the lines as printed.
+        fh = getattr(self.stream, 'buffer', self.stream)
         while not self.stopped.is_set():
-            code   = self.model.tick()
-            counts = self._counts(code)
-
-            # The firmware runs the detector on every sample of every active
-            # channel; channel 0 is the primary one it reports on.
-            m = self.det.update(counts[0], sample * DT_US, sample)
-            if m is not None:
-                self._event_text(m)
-
-            if (sample % DECIM) == 0:
-                frame.append((sample, code, counts))
-                if len(frame) >= POINTS:
-                    self._emit(frame)
-                    frame = []
-
-            sample += 1
-            if paced:
-                # Sleep only once every few milliseconds: a Windows timer tick is
-                # ~1 ms, so one sleep per sample would pace this to a third of the
-                # speed.  Behind by a lot (a slow host, or a step in the debugger)?
-                # Re-base instead of accumulating a debt we can never pay off.
-                next_t += dt
-                delay = next_t - time.time()
-                if delay > PACE_MIN_SLEEP:
-                    time.sleep(delay)
-                elif delay < -0.05:
-                    next_t = time.time()
-
-    def _emit(self, frame):
-        for (index, code, counts) in frame:
-            self.parser.feed_line('S,%d,%d%s'
-                                  % (index, code,
-                                     ''.join(',%d:%d' % (c, count) for c, count
-                                             in enumerate(counts))))
-
-    def _event_text(self, m):
-        """The M7's own wording, so the log pane reads like a monitor session.
-
-        Word for word printBundle() in sorter-firmware.ino, window included: the
-        parser turns these two lines into the decision overlay the page draws, so
-        feeding them through feed_line() is what makes the simulator exercise the
-        very path the board's serial text takes.
-        """
-        self.parser.feed_line('Event #%d  %sreason=%d %s  window=%d..%dus/%dsmp  '
-                              'primary=ch0  mode=linked'
-                              % (m['index'],
-                                 'VALID     ' if m['valid'] else 'rejected  ',
-                                 m['reason'], REASON_NAME[m['reason']],
-                                 m['start_us'], m['start_us'] + m['width_us'],
-                                 m['width_samples']))
-        self.parser.feed_line('  ch0  max=%d  area=%d  width=%dus/%dsmp  base=%.0f  %s'
-                              % (m['max_value'], int(m['area']), m['width_us'],
-                                 m['width_samples'], m['baseline'],
-                                 'VALID' if m['valid']
-                                 else 'rejected ' + REASON_NAME[m['reason']]))
+            try:
+                data = fh.read(256)
+            except (OSError, ValueError):
+                break
+            if not data:
+                break
+            if isinstance(data, bytes):
+                self.parser.feed_bytes(data)
+            else:
+                self.parser.feed_line(data)
+        self.parser.flush()
+        if not self.stopped.is_set():
+            self.parser.log('stdin: end of input - the page keeps the last window '
+                            '(Ctrl+C stops the viewer)')
 
     def stop(self):
         self.stopped.set()
@@ -696,15 +1036,29 @@ const ML = 78, MR = 16, MT = 26, MB = 36;             // canvas margins
 // rejected ones orange, and the baseline the detector froze is deep violet.
 const EV_OK = '#1b5e20', EV_BAD = '#e65100', EV_BASE = '#4a148c';
 const EV_FILL_OK = 'rgba(27,94,32,0.10)', EV_FILL_BAD = 'rgba(230,81,0,0.10)';
-/* The two ways a window can be technically right and still hide the truth, each in a
-   colour of its own so neither reads as a measured channel:
+/* The three ways a window can be technically right and still hide the truth, each in a
+   colour of its own so none reads as a measured channel:
      EV_DIP     - the trace falls between two peaks, i.e. one window covers a pair;
      EV_SUPPORT - the reported max is more than the trace can carry: no plotted sample
                   comes near it, or the one that does stands alone.  An impulse is the
                   usual reason (the decimation dropped it), a pulse sharper than the
                   trace can draw is the other - the marker says "look here", not
-                  "impulse did it". */
-const EV_DIP = '#00695c', EV_SUPPORT = '#0277bd';
+                  "impulse did it";
+     EV_RISE    - the trace climbs to its own top faster than the stream can show a
+                  real bead's edge.  The AD7606 sees a bead as a dome tens of
+                  milliseconds wide; a climb inside EV_RISE_MS is a spike, an edge the
+                  analog front end is still settling, or a bad sample - and the same
+                  suspects the max notes point at. */
+const EV_DIP = '#00695c', EV_SUPPORT = '#0277bd', EV_RISE = '#8e24aa';
+/* The width floor the board's header announces (`minw=`, in samples of the event's
+   DURATION - config.h's DET_MIN_WIDTH_SAMPLES).  Drawn on every window the overlay draws
+   as a *band* the floor wide, centred on the window: the duration the detector estimates
+   is centred on the excursion it measured, so a window whose width comes back under the
+   band is one it refused as too short - and a `w=27smp` tag can be *seen* to be under the
+   floor instead of only read as narrow.  The width that window *was* judged with is drawn
+   as the rule in the verdict's colour (see drawEvents).  A colour of its own, for the same
+   reason the three above have theirs. */
+const EV_FLOOR = '#5d4037';
 const EV_LOBES    = 2;      // excursions above half height that make "more than one"
 const EV_DIP_PTS  = 2;      // plotted points an excursion has to hold, either way
 const EV_DIP_DROP = 0.4;    // of a peak's own height: how far down it is over
@@ -712,7 +1066,15 @@ const EV_MAX_PTS  = 4;      // plotted points a window needs for max= to be judg
 const EV_MAX_MISS = 0.25;   // .. and how far short of the reported max is too far
 const EV_NEAR_SPAN = 0.15;  // of that window, each side of the apex: "the shape"
 const EV_SPIKE_PTS = 6;     // plotted points a lone apex has to sit inside first
-const EV_LANES = 3;              // tag rows packed along the top of the pane
+const EV_RISE_MS   = 1.0;   // ms: a climb the trace shows no longer than this is fast
+const EV_RISE_FRAC = 0.1;   // of the peak's height: where the climb is taken to start
+const EV_LANES = 5;              // tag rows packed along the top of the pane.  Three was
+                                 // one too few for a region of long tags: the packing gives
+                                 // up at the last lane and draws over whatever is already
+                                 // there, which is how a disputed window's numbers (`rej
+                                 // SHORT_FOR_HEIGHT  w=54smp ... >= floor 35smp`) ended up
+                                 // hidden behind a healthy neighbour's tag.  The extra rows
+                                 // are only used where the tags actually collide.
 const EV_KEEP = 400;             // decisions kept in the page (mirrors EVENT_KEEP)
 const FRAME_PTS = 64;            // points in one stream frame (mirrors POINTS)
 
@@ -725,7 +1087,7 @@ let meta = { channels: [], decim: 10, sample_rate: 10000, range: RANGE_V,
 let gen = null, chans = [];
 let showGen = true, autoY = true, fullScale = false, paused = false, frozen = null;
 let showEvents = true, events = [];      // detector decisions, oldest first
-let flagTally = { judged: 0, dip: 0, max: 0 };  // windows the trace disagreed with
+let flagTally = { judged: 0, dip: 0, max: 0, rise: 0 };  // windows the trace disagreed with
 let received = 0, t0 = 0, rate = 0, newest = null, dirty = true, lastDraw = 0;
 let viewSec = VIEW_S, viewTouched = false;   // the rolling window, in seconds
 
@@ -754,17 +1116,47 @@ function syncView(){
   el('viewout').textContent = viewSec.toFixed(2) + ' s';
 }
 
+/* One series = the points of one trace, each kept with the sample index it was
+   taken at.  The index is what the canvas positions on, never a count of points:
+   a frame that never arrived then leaves the gap the stream had instead of sliding
+   the whole trace under the detector windows, which are drawn at their absolute
+   sample indices (see addPoint / resetSeries / traceIn). */
 function newSeries(label, dashed, color){
-  return { label: label, first: null, vals: [], dashed: dashed, color: color };
+  return { label: label, idx: [], vals: [], dashed: dashed, color: color };
+}
+
+/* Where a sample index falls in a series: idx is strictly increasing, so these bound
+   the range to draw or to judge.  Binary search, because a window is judged against
+   the points the stream really printed inside it - and after a gap those are not at
+   a fixed offset any more.  `atOrAfter` may return idx.length and `atOrBefore` may
+   return -1: k0 > k1 then means "nothing in range", which every caller already
+   treats as an empty series. */
+function atOrAfter(idx, i){
+  let lo = 0, hi = idx.length;                    // first k with idx[k] >= i
+  while (lo < hi){
+    const mid = (lo + hi) >> 1;
+    if (idx[mid] < i) lo = mid + 1; else hi = mid;
+  }
+  return lo;
+}
+
+function atOrBefore(idx, i){
+  let lo = 0, hi = idx.length;                    // first k with idx[k] > i
+  while (lo < hi){
+    const mid = (lo + hi) >> 1;
+    if (idx[mid] <= i) lo = mid + 1; else hi = mid;
+  }
+  return lo - 1;
 }
 
 function buildSeries(){
   chans = (meta.channels || []).map((c, k) =>
             newSeries('ch' + c, false, COLORS[k % COLORS.length]));
   gen   = newSeries('expected', true, '#1565c0');
+  gen.scale = meta.gen_scale || 1;         // DAC code -> AD7606 counts (see applyMeta)
   received = 0; t0 = performance.now(); newest = null; frozen = null;
   events = [];
-  flagTally = { judged: 0, dip: 0, max: 0 };
+  flagTally = { judged: 0, dip: 0, max: 0, rise: 0 };
   renderLegend();
 }
 
@@ -791,34 +1183,72 @@ function renderLegend(){
   ep.appendChild(bsw);
   ep.appendChild(document.createTextNode(
     ' frozen baseline, reported max (dashed; green accepted, orange rejected)'));
-  /* .. plus the two things only the trace can show: a dip between two peaks, and a
-     max no sample of the window can reach. */
+  /* .. plus the three things only the trace can show: a dip between two peaks, a max
+     no sample of the window can reach, and an edge no dome has. */
   const dsw = document.createElement('span');
   dsw.className = 'sw'; dsw.style.background = EV_DIP;
   ep.appendChild(dsw);
   const msw = document.createElement('span');
   msw.className = 'sw'; msw.style.background = EV_SUPPORT;
   ep.appendChild(msw);
+  const rsw = document.createElement('span');
+  rsw.className = 'sw'; rsw.style.background = EV_RISE;
+  ep.appendChild(rsw);
+  /* .. and the floor they were all judged against, whenever the board announces one. */
+  const mw = meta.min_width || 0;
+  if (mw > 0){
+    const wsw = document.createElement('span');
+    wsw.className = 'sw'; wsw.style.background = EV_FLOOR;
+    ep.appendChild(wsw);
+  }
   ep.appendChild(document.createTextNode(
-    ' dip between peaks / max above the trace'));
+    ' dip between peaks / max above the trace / fast rise'
+    /* The floor is a floor on the event's *duration*: the rule under the window is the
+       duration it measured, green while that cleared the band - orange only when the floor
+       is what refused the window (`rej WIDTH_TOO_NARROW`).  A window refused on the shape
+       bounds instead (`rej SHORT_FOR_HEIGHT`) keeps its green rule, which is the whole
+       point of colouring the rule by the width question alone - see drawEvents(). */
+    + (mw > 0 ? ' / width floor ' + mw + 'smp (' + (mw * 1000
+        / (meta.sample_rate || 10000)).toFixed(1)
+        + 'ms) of duration: the rule under each window is green while its width cleared '
+        + 'the band, orange only when the floor is what refused it' : '')));
   /* The overlay key is only meaningful while the overlay is on. */
   if (showEvents) lg.appendChild(ep);
 }
 
 function metaText(){
   const sr = meta.sample_rate || 0, d = meta.decim || 1;
+  const mw = meta.min_width || 0;
   return 'source ' + meta.source
        + '   ' + (meta.streaming ? 'stream on' : 'stream off')
        + '   ' + (sr / 1000).toFixed(1) + ' kSPS, decim ' + d
        + '   window ' + viewSec.toFixed(2) + ' s (' + viewPoints() + ' pts, '
        + keepPoints() + ' kept = ' + keepSeconds().toFixed(1) + ' s)'
        + '   range +/-' + meta.range + ' V  (full scale +/-32768 counts)'
-       + '   waveform gen ' + (meta.wf ? 'on' : 'off');
+       + '   waveform gen ' + (meta.wf ? 'on' : 'off')
+       /* The floor the board judged with, as the board's own samples and as time - the
+          same number every window's floor band is drawn from (see drawEvents), so the
+          page never has to be told twice.  It is a floor on the event's *duration*. */
+       + (mw > 0 ? '   width floor ' + mw + 'smp/'
+                   + (mw * 1000 / (sr || 10000)).toFixed(1) + 'ms of duration (the '
+                   + 'coloured rule is orange only on a width rejection)' : '');
 }
 
 function applyMeta(m){
   const changed = (m.channels || []).length !== chans.length;
   meta = m;
+  /* The gen column is a DAC code while the channel columns are AD7606 counts, so the
+     expected trace only overlays the measured ones once the code is scaled - that is
+     what gen_scale is (SIGNALGEN_ADC_PER_DAC, i.e. the strap --range names: 2.64
+     counts per code at +/-10 V, 5.28 at +/-5 V).  Re-scale whatever is already held
+     when the value changes, so one trace never mixes two scales. */
+  if (gen && gen.vals.length){
+    const was = gen.scale || 1, now = meta.gen_scale || 1;
+    if (was !== now){
+      for (let k = 0; k < gen.vals.length; k++) gen.vals[k] = gen.vals[k] * now / was;
+    }
+  }
+  if (gen) gen.scale = meta.gen_scale || 1;
   /* The server owns the two window numbers - it is what keeps (and re-primes) the
      samples - so take them from the meta line unless the slider has been touched
      already, and never let the window exceed the seconds being kept. */
@@ -835,15 +1265,20 @@ function applyMeta(m){
 function applyData(m){
   if (paused) return;
   const d = meta.decim || 1, i0 = m.i;
+  const n = (m.adc && m.adc[0] ? m.adc[0].length : (m.gen ? m.gen.length : 0));
+  const held = newestHeld();
+  if (n && held !== null && i0 <= held) resetSeries();
   if (m.gen) {
-    for (let k = 0; k < m.gen.length; k++) addPoint(gen, i0 + k * d, m.gen[k]);
+    /* Scaled where it is added: the page draws counts, the stream carries DAC codes
+       (see applyMeta). */
+    const gs = meta.gen_scale || 1;
+    for (let k = 0; k < m.gen.length; k++) addPoint(gen, i0 + k * d, m.gen[k] * gs);
   }
   (m.adc || []).forEach((vals, c) => {
     const s = chans[c];
     if (!s || !vals) return;
     for (let k = 0; k < vals.length; k++) addPoint(s, i0 + k * d, vals[k]);
   });
-  const n = (m.adc && m.adc[0] ? m.adc[0].length : 0);
   received += n;
   if (n) newest = i0 + (n - 1) * d;
   trimAll();
@@ -867,9 +1302,34 @@ function applyEvents(list){
   dirty = true;
 }
 
+/* One point of one trace: the value AND the sample index it was taken at.  Nothing
+   here looks at the clock: the index travels with the point, so a frame that never
+   arrived cannot shift the ones after it. */
 function addPoint(s, i, v){
-  if (s.first === null) s.first = i;
+  s.idx.push(i);
   s.vals.push(v);
+}
+
+/* The newest sample index any trace is holding - null while nothing has arrived. */
+function newestHeld(){
+  let last = null;
+  [gen].concat(chans).forEach((s) => {
+    if (s.idx.length && (last === null || s.idx[s.idx.length - 1] > last)){
+      last = s.idx[s.idx.length - 1];
+    }
+  });
+  return last;
+}
+
+/* Drop every held point because the stream went backwards.  That is what a browser
+   that just reconnected is handed: StreamState.subscribe primes it with the whole
+   buffer again, from the oldest sample it still keeps.  Appending that on top of the
+   points already held would fold the trace back over itself and leave it - and now
+   the detector windows with it - drawn at the wrong place, so the traces restart at
+   the frame they are given.  The decisions are kept: they are absolute indices and
+   still name the samples they were taken on. */
+function resetSeries(){
+  [gen].concat(chans).forEach((s) => { s.idx = []; s.vals = []; });
 }
 
 function trimAll(){
@@ -883,7 +1343,7 @@ function trim(s){
   const extra = s.vals.length - keepPoints();
   if (extra > 0){
     s.vals.splice(0, extra);
-    s.first += extra * (meta.decim || 1);    // indices stay absolute
+    s.idx.splice(0, extra);
   }
 }
 
@@ -904,14 +1364,37 @@ function addLog(line){
      * before a full window has arrived the pane shows what there is and the scale
        grows with it (clamped at t = 0, so the times never go negative);
      * only the points inside the window are scanned for Y - auto Y fits what is on
-       screen instead of a peak that has already scrolled out of it. */
+       screen instead of a peak that has already scrolled out of it, and it does so in
+       deliberate steps rather than on every frame (see AUTO_STEPS below). */
+/* ---- the vertical scale ------------------------------------------------- */
+/* Auto Y follows what is on screen, but deliberately.  A pane that re-fits to the
+   window's min/max on every frame moves the whole trace whenever a tall peak or impulse
+   enters or leaves the window (the bench capture spans x2-x3 between one window and the
+   next), and one that zooms onto the noise of a quiet window crawls across the pane as
+   the generator's DC wander moves - both look like the *signal* moving, which is the one
+   thing this pane must not do.  So the scale is quantised, it grows the moment a sample
+   does not fit, it steps down only once a smaller range has held for AUTO_SHRINK_MS, and
+   it never goes below AUTO_MIN_SPAN: a window with no peak in it still shows the noise as
+   noise instead of as a wall. */
+const AUTO_STEPS     = [100, 200, 250, 500, 800, 1000, 2000, 2500, 5000, 10000, 20000,
+                        25000, 50000];
+const AUTO_MIN_SPAN  = 800;      // counts: ~2.5 % of full scale (+/-32768)
+const AUTO_PAD       = 0.08;     // head/foot room, as a fraction of the range
+const AUTO_SHRINK_MS = 1200;     // a smaller range has to hold this long to be adopted
+function autoStep(need){
+  for (let k = 0; k < AUTO_STEPS.length; k++){
+    if (AUTO_STEPS[k] >= need) return AUTO_STEPS[k];
+  }
+  return AUTO_STEPS[AUTO_STEPS.length - 1];
+}
+
 function visible(){
-  const d = meta.decim || 1, sr = meta.sample_rate || 10000;
+  const sr = meta.sample_rate || 10000;
   const all = (showGen ? [gen] : []).concat(chans);
   let x1 = -Infinity;
   all.forEach((s) => {
-    if (!s || s.first === null || !s.vals.length) return;
-    const last = s.first + (s.vals.length - 1) * d;
+    if (!s || !s.idx.length) return;
+    const last = s.idx[s.idx.length - 1];
     if (last > x1) x1 = last;
   });
   if (x1 === -Infinity) return null;
@@ -934,10 +1417,28 @@ function visible(){
     // +/-10 V and 20333 at +/-5 V.  Auto Y would zoom onto that and hide how
     // much of the scale is left.
     y0 = -ADC_FULL_SCALE; y1 = ADC_FULL_SCALE;
+    frozen = { step: 2 * ADC_FULL_SCALE, mid: 0 };
   } else if (autoY || frozen === null){
-    const pad = Math.max((y1 - y0) * 0.08, 8);
-    y0 -= pad; y1 += pad;
-    frozen = { y0: y0, y1: y1 };
+    const need = Math.max(y1 - y0, AUTO_MIN_SPAN) * (1 + 2 * AUTO_PAD);
+    const step = autoStep(need);
+    const mid  = 0.5 * (y0 + y1);
+    const now  = performance.now();
+    if (frozen === null || frozen.step === undefined){
+      frozen = { step: step, mid: mid, at: now };
+    } else if (step > frozen.step){
+      // A sample does not fit: grow to the step that holds it, and follow its centre.
+      frozen.step = step; frozen.mid = mid; frozen.at = now;
+    } else if (now - frozen.at >= AUTO_SHRINK_MS){
+      /* It has fitted for a while: close in, at most halving each time so the pane
+         settles instead of snapping, and follow the window's centre if the signal has
+         drifted away from the pane's. */
+      const want = autoStep(Math.max(need, 0.5 * frozen.step));
+      frozen.step = (want < step) ? step : want;
+      if (Math.abs(mid - frozen.mid) > 0.25 * frozen.step){ frozen.mid = mid; }
+      frozen.at = now;
+    }
+    y0 = frozen.mid - 0.5 * frozen.step;
+    y1 = frozen.mid + 0.5 * frozen.step;
   } else {
     y0 = frozen.y0; y1 = frozen.y1;
   }
@@ -988,7 +1489,7 @@ function draw(){
   }
 
   /* A vertical line every step of captured time (see xTicks). */
-  const sr = meta.sample_rate || 10000, d = meta.decim || 1;
+  const sr = meta.sample_rate || 10000;
   const tk = xTicks(view);
   g.textAlign = 'center'; g.textBaseline = 'top';
   for (let n = Math.ceil(view.x0 / tk.step); n * tk.step <= view.x1; n++){
@@ -1004,18 +1505,19 @@ function draw(){
 
   const order = (showGen ? [gen] : []).concat(chans);
   order.forEach((s) => {
-    if (!s || s.first === null || s.vals.length < 2) return;
+    if (!s || s.idx.length < 2) return;
     /* Only the points inside the window: the buffer holds keepPoints() of them, so
-       drawing all of it would draw (and join) points that are not shown. */
-    const k0 = Math.max(0, Math.ceil((view.x0 - s.first) / d));
-    const k1 = Math.min(s.vals.length - 1, Math.floor((view.x1 - s.first) / d));
+       drawing all of it would draw (and join) points that are not shown.  Bounded by
+       index, not by a stride: a frame the page never got shows up as the gap it is
+       rather than pulling the rest of the trace left. */
+    const k0 = atOrAfter(s.idx, view.x0), k1 = atOrBefore(s.idx, view.x1);
     if (k1 - k0 < 1) return;
     g.strokeStyle = s.color;
     g.lineWidth = s.dashed ? 1.5 : 1.2;
     g.setLineDash(s.dashed ? [6, 4] : []);
     g.beginPath();
     for (let k = k0; k <= k1; k++){
-      const x = X(s.first + k * d), y = Y(s.vals[k]);
+      const x = X(s.idx[k]), y = Y(s.vals[k]);
       if (k > k0) g.lineTo(x, y); else g.moveTo(x, y);
     }
     g.stroke();
@@ -1053,11 +1555,10 @@ function seriesFor(ch){
 /* The plotted samples of `s` inside [i0, i1] as { i, v } - one point per DECIM-th raw
    sample, i.e. the points the trace is drawn from. */
 function traceIn(s, i0, i1){
-  const out = [], d = meta.decim || 1;
-  if (s === null || s.first === null || !s.vals.length) return out;
-  const k0 = Math.max(0, Math.ceil((i0 - s.first) / d));
-  const k1 = Math.min(s.vals.length - 1, Math.floor((i1 - s.first) / d));
-  for (let k = k0; k <= k1; k++) out.push({ i: s.first + k * d, v: s.vals[k] });
+  const out = [];
+  if (s === null || !s.idx.length) return out;
+  const k0 = atOrAfter(s.idx, i0), k1 = atOrBefore(s.idx, i1);
+  for (let k = k0; k <= k1; k++) out.push({ i: s.idx[k], v: s.vals[k] });
   return out;
 }
 
@@ -1067,7 +1568,8 @@ function judge(ev){
   if (ev.q && (ev.qdone || ev.qcov === newest)) return ev.q;
   const d = meta.decim || 1;
   const q = { ch: null, lobes: 0, dip: null, dipIdx: null, tops: [],
-              support: null, why: null, apexIdx: null, apexV: null };
+              support: null, why: null, apexIdx: null, apexV: null,
+              rise: null, riseIdx: null, riseTop: null };
   const s = seriesFor(ev.channel);
   const pts = (s === null) ? [] : traceIn(s, ev.start, ev.end);
 
@@ -1144,15 +1646,32 @@ function judge(ev){
         }
       }
     }
+    /* Fast or slow is the other half of "is this a bead".  Measure the climb to the
+       trace's own top: walk back from the apex to the last plotted point still within
+       EV_RISE_FRAC of the baseline and see how much of the board's clock that is.  A
+       decimated stream cannot resolve anything finer than one plotted interval, so the
+       measurement is a ceiling: when it lands at or under EV_RISE_MS the true edge is
+       at most that, which is why the note says "<=" and not "=".  Only for a window
+       whose max the trace does carry - a max the trace misses says more, and a lone
+       apex is a fast edge by construction. */
+    if (span >= EV_MAX_PTS && ev.max > 0 && q.support === null && top > ev.base){
+      const low = ev.base + EV_RISE_FRAC * (top - ev.base);
+      let j = kTop;
+      while (j > 0 && pts[j - 1].v > low) j--;
+      const riseSmp = (kTop - j) * d;
+      const limit = Math.round(EV_RISE_MS * (meta.sample_rate || 10000) / 1000);
+      if (j > 0 && riseSmp > 0 && riseSmp <= limit){    // j==0: the window opens mid-climb
+        q.rise = riseSmp; q.riseIdx = pts[j].i; q.riseTop = top;
+      }
+    }
   }
-
-  ev.q = q; ev.qcov = newest;
   if (newest !== null && newest > ev.end){         // the whole window is in hand
     ev.qdone = true;
     if (q.ch !== null){                            // tally it once, for the stats line
       flagTally.judged++;
       if (q.lobes >= EV_LOBES) flagTally.dip++;
       if (q.support !== null) flagTally.max++;
+      if (q.rise !== null) flagTally.rise++;
     }
   }
   return q;
@@ -1168,9 +1687,19 @@ function judge(ev){
    width; in per-channel mode a channel can be narrower than the group window, and
    the tag then spells out both.
 
-   Two things the lines cannot show are read off the trace and drawn in their own
-   colours: a dip between two peaks inside one window (EV_DIP) and a max the window's
-   own samples do not support (EV_SUPPORT).  See judge(). */
+   Three things the lines cannot show are read off the trace and drawn in their own
+   colours: a dip between two peaks inside one window (EV_DIP), a max the window's own
+   samples do not support (EV_SUPPORT), and an edge the trace climbs faster than a bead
+   can (EV_RISE).  See judge().
+
+   The width floor the board announced rides on every window as a band of its own
+   (EV_FLOOR, `minw` samples of *duration* centred on the window), because that is the
+   number the firmware refused or accepted the window against: a window whose width is
+   under the band is one it calls too narrow.  What that window's width *was* - the
+   duration the detector estimated for it, which is the number the tag shows and the band
+   is compared with - is drawn as a rule coloured by the width question alone (see wCol):
+   green while it cleared the band, orange only when the floor is what refused the window,
+   so a window refused on the shape bounds cannot read as a width rejection. */
 function drawEvents(view, X, Y, tags){
   const top = MT, bot = cv.height - MB;
   events.forEach((ev) => {
@@ -1188,6 +1717,36 @@ function drawEvents(view, X, Y, tags){
       g.beginPath(); g.moveTo(x, top); g.lineTo(x, bot); g.stroke();
     });
 
+    /* The width floor the board announced, as a BAND centred on the window.  The number
+       is a floor on the event's *duration* (`minw` samples of it), and the duration the
+       detector estimates is centred on the excursion it measured - so a window whose own
+       width comes back under the band is one it refused as too narrow, which is what its
+       w= tag says.  The estimate itself is drawn just below (the duration rule), which is
+       what makes the pair readable: the band is what was needed, the rule what was
+       measured. */
+    const mw  = meta.min_width || 0;
+    const mid = 0.5 * (ev.start + ev.end);
+    if (mw > 0){
+      g.strokeStyle = EV_FLOOR; g.lineWidth = 1; g.setLineDash([1, 4]);
+      [mid - 0.5 * mw, mid + 0.5 * mw].forEach((i) => {
+        const x = Math.round(X(i)) + 0.5;
+        g.beginPath(); g.moveTo(x, top); g.lineTo(x, bot); g.stroke();
+      });
+      g.setLineDash([]);
+    }
+
+    /* The width question has its own answer, and it is NOT the event's verdict: the floor
+       only ever refused a window the firmware reported as WIDTH_TOO_NARROW (or, at the
+       other end, WIDTH_TOO_WIDE).  An event refused on the *shape* bounds - the ones a
+       needle trips, `rej SHORT_FOR_HEIGHT` - can carry a duration well over the band, and
+       painting its rule in the rejection colour is what makes a rise/slope rejection read
+       as a width one (and the tag beside it as a contradiction).  So the rule is coloured
+       by the width test alone: green while the duration is at or over the floor, orange
+       when the floor is what refused the window.  The tag spells the comparison out. */
+    const wRej = (ev.reason === 2 || ev.reason === 3);          // the width reasons
+    const wCol = (wRej || (mw > 0 && ev.width_smp > 0 && ev.width_smp < mw))
+               ? EV_BAD : EV_OK;
+
     const yb = Math.round(Y(ev.base)) + 0.5;
     const ym = Math.round(Y(ev.base + ev.max)) + 0.5;
     g.strokeStyle = EV_BASE; g.setLineDash([4, 3]);         // frozen baseline
@@ -1195,6 +1754,25 @@ function drawEvents(view, X, Y, tags){
     g.strokeStyle = col; g.setLineDash([6, 3]);             // the peak it reported
     g.beginPath(); g.moveTo(e0, ym); g.lineTo(e1, ym); g.stroke();
     g.setLineDash([]);
+
+    /* The width the bounds were judged with - the event's duration, and the number the
+       floor band above is drawn from - as a rule along the baseline, in the *width*'s own
+       colour (wCol: green when this duration cleared the band, orange when the floor is
+       what refused the window - the event's verdict may have come from another bound
+       entirely).  The shaded window is the span the *measurement* covered; where the two
+       differ, the duration is the longer (a faint pulse is cut off high up its flanks).
+       See EventDetector::envelopeDuration and the `w=` / `(exc ..)` tag.
+
+       It is drawn on the same time scale as everything else (X()), centred on the window,
+       so its *length* is the estimate and its position is simply where the event is - the
+       same reference the floor band above is measured against. */
+    if (ev.width_smp > 0){
+      const xa = Math.round(X(mid - 0.5 * ev.width_smp)) + 0.5;
+      const xb = Math.round(X(mid + 0.5 * ev.width_smp)) + 0.5;
+      g.strokeStyle = wCol; g.lineWidth = 2; g.setLineDash([2, 2]);
+      g.beginPath(); g.moveTo(xa, yb); g.lineTo(xb, yb); g.stroke();
+      g.lineWidth = 1; g.setLineDash([]);
+    }
 
     /* What the trace says the window does not: a dip between two peaks, and a max the
        window's own samples never reach (or reach only at one lone point). */
@@ -1224,6 +1802,18 @@ function drawEvents(view, X, Y, tags){
       }
     }
 
+    if (q.rise !== null){
+      /* The edge itself, where the trace made it: from the point the climb started to
+         the top it reached.  A slope this steep is the shape of a spike, not a dome. */
+      const xr = Math.round(X(q.riseIdx)) + 0.5;
+      const ya = Math.round(Y(ev.base)) + 0.5;
+      const xt = Math.round(X(q.riseIdx + q.rise)) + 0.5;
+      const yt = Math.round(Y(q.riseTop)) + 0.5;
+      g.strokeStyle = EV_RISE; g.lineWidth = 2;
+      g.beginPath(); g.moveTo(xr, ya); g.lineTo(xt, yt); g.stroke();
+      g.lineWidth = 1;
+    }
+
     const notes = [];
     if (q.lobes >= EV_LOBES){
       notes.push({ col: EV_DIP, text: '  ' + q.lobes + ' peaks  dip '
@@ -1235,14 +1825,32 @@ function drawEvents(view, X, Y, tags){
       notes.push({ col: EV_SUPPORT, text: (q.why === 'trace' ? '  !max (' : '  ?max (')
                     + q.why + ' ' + Math.round(q.support) + ')' });
     }
+    if (q.rise !== null){
+      /* A ceiling, not a measurement: the stream's own resolution is the floor of what
+         can be read off the trace, so the note says "at most". */
+      notes.push({ col: EV_RISE, text: '  !rise <=' + Math.round(q.rise * 1e6
+                    / (meta.sample_rate || 10000)) + 'us' });
+    }
 
     tags.push({ x: x0 + 3, col: col, notes: notes,
                 text: '#' + ev.index + ' ch' + ev.channel + ' '
                       + (ev.valid ? 'VALID' : 'rej ' + ev.reason_name)
                       + '  w=' + ev.width_smp + 'smp  max=' + ev.max
                       + '  base=' + ev.base
+                      /* `w=` is the event's *duration* - the width the bounds were judged
+                         with and the one the floor band is drawn from - while the window
+                         itself is the excursion the measurement covered.  The two differ
+                         whenever the pulse is faint enough for the envelope to widen it,
+                         so the measured span is printed beside it. */
                       + (ev.width_smp === (ev.end - ev.start) ? ''
-                         : '  (win ' + (ev.end - ev.start) + 'smp)') });
+                         : '  (exc ' + (ev.end - ev.start) + 'smp)')
+                      /* On a rejected window the floor comparison is spelled out, because
+                         `rej <reason>` next to a `w=` over the floor is exactly the reading
+                         that goes wrong: the reason word names the bound that refused it,
+                         this says whether the width floor was one of them. */
+                      + (!ev.valid && mw > 0 && ev.width_smp > 0
+                         ? (ev.width_smp >= mw ? '  >= floor ' : '  < floor ')
+                           + mw + 'smp' : '') });
   });
 }
 
@@ -1308,11 +1916,13 @@ function eventsText(){
 /* What the trace said about the windows it was asked to judge - a running count, so
    the numbers also cover windows that have since scrolled out of the trace.  "max?"
    is a reported peak no plotted sample came near, or one only a single point reached:
-   the trace cannot prove an impulse did it, but it is where to look. */
+   the trace cannot prove an impulse did it, but it is where to look.  "fast rise" is a
+   peak the trace climbs to inside EV_RISE_MS, which a bead's dome never does. */
 function flagsText(){
   if (!flagTally.judged) return '';
   return '   read back ' + flagTally.judged + ' windows: '
-       + flagTally.dip + ' two-peak, ' + flagTally.max + ' max?';
+       + flagTally.dip + ' two-peak, ' + flagTally.max + ' max?, '
+       + flagTally.rise + ' fast rise';
 }
 
 /* ---- live wiring ------------------------------------------------------ */
@@ -1449,24 +2059,65 @@ def main(argv=None):
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog='examples:\n'
                '  py -3 test/live_plot.py --sim\n'
-               '  py -3 test/live_plot.py --sim --window 2 --http-port 9000\n'
+               '  py -3 test/live_plot.py --sim --sim-ladder     # the floor, drawn\n'
+               '  py -3 test/live_plot.py --sim --sim-cycles 6 --window 2 '
+               '--http-port 9000\n'
+               '  py -3 test/live_plot.py --sim --sim-speed 0 --no-open\n'
+               '  py -3 test/live_plot.py --stdin < bench.txt\n'
+               '  test\\test_bench_detect.exe --stream | py -3 test/live_plot.py '
+               '--stdin\n'
                '  py -3 test/live_plot.py --port COM7')
 
     src = p.add_argument_group('source')
     src.add_argument('--port', help='serial port of the M7 UART, e.g. COM7')
+    src.add_argument('--stdin', action='store_true',
+                     help='read the board text from stdin: a capture file '
+                          '("--stdin < bench.txt") or a pipe '
+                          '(test_bench_detect.exe --stream | ... --stdin)')
     src.add_argument('--sim', action='store_true',
-                     help='no board: signal_model.py generates the waveform')
+                     help='no board: run test_bench_detect.exe --stream and draw the '
+                          'firmware\'s own decisions')
+    src.add_argument('--firmware', metavar='EXE', default=None,
+                     help='bench harness to run for --sim (default: '
+                          'test/test_bench_detect.exe next to this script)')
+    src.add_argument('--sim-cycles', type=int, default=4,
+                     help='pattern cycles the harness generates (default %(default)s, '
+                          '1 cycle = 2 s of stream)')
+    src.add_argument('--sim-start', choices=('hold', 'live'), default=None,
+                     help='the harness\'s quiet period: hold (default) = noise only, '
+                          'live = the pulses run from sample 0, the board\'s boot '
+                          'reality')
+    src.add_argument('--sim-ladder', action='store_true',
+                     help='run the harness\'s floor ladder (SIGNALGEN_LADDER_* in '
+                          'config.h) instead of the random train: a staircase of '
+                          'isolated pulses whose apexes step up from below the '
+                          'detector\'s floor, so the pane\'s own scale settles on them '
+                          'and "how close to the baseline can a peak be and still be '
+                          'detected" can be *seen*.  The harness\'s own --ladder-* '
+                          'flags move the staircase: pipe its --stream here for a '
+                          'different width, min, step or count')
+    src.add_argument('--sim-frontend', type=int, default=None, metavar='TAPS',
+                     help='analog front end the harness models: 1 = none, 3 = a real '
+                          'board (default)')
+    src.add_argument('--hw', action='store_true',
+                     help='harness runs two slightly mismatched modules instead of '
+                          'an ideal pair')
+    src.add_argument('--sim-repeat', action='store_true',
+                     help='replay the harness capture over and over, continuing the '
+                          'sample indices (the board\'s timeline) between passes')
     src.add_argument('--sim-speed', type=float, default=1.0,
                      help='simulated time scale: 2 = twice as fast, '
                           '0 = as fast as Python can (default 1)')
     src.add_argument('--sim-seed', type=lambda s: int(s, 0), default=None,
-                     help='override the simulated generator seed')
+                     help='override the harness waveform seed')
     src.add_argument('--no-stream-command', action='store_true',
                      help='never send "T1"/"T0" (the board is already streaming)')
 
     view = p.add_argument_group('view')
     view.add_argument('--channels', type=int, default=CHANNELS,
-                      help='simulated and plotted channel count (default %(default)s)')
+                      help='simulated and plotted channel count (default %(default)s; '
+                           'the firmware path streams whatever SORTER_STREAM_CHANNELS '
+                           'selects)')
     view.add_argument('--range', dest='range_v', type=float, default=10.0,
                       help='AD7606 full-scale input in volts (default %(default)s)')
     view.add_argument('--window', type=float, default=VIEW_SEC,
@@ -1485,8 +2136,9 @@ def main(argv=None):
                       help='leave the board streaming on exit (no "T0")')
     args = p.parse_args(argv)
 
-    if not args.sim and not args.port:
-        p.error('give --port COMx for the board, or --sim to run without one')
+    if not args.sim and not args.port and not args.stdin:
+        p.error('give --port COMx for the board, --sim for the bench harness, or '
+                '--stdin for a capture/pipe')
 
     # The window is measured in seconds, so an old point count ("--window 2000") would
     # ask for a buffer no page could draw: keep the two sensible and in order.
@@ -1498,8 +2150,13 @@ def main(argv=None):
     state = StreamState(window=view_points(keep_sec), window_sec=view_sec,
                         keep_sec=keep_sec)
     if args.sim:
-        source = SimSource(state, args.range_v, speed=args.sim_speed,
-                           channels=max(args.channels, 1), seed=args.sim_seed)
+        source = FirmwareSource(state, args.range_v, speed=args.sim_speed,
+                                seed=args.sim_seed, exe=args.firmware,
+                                cycles=args.sim_cycles, frontend=args.sim_frontend,
+                                start=args.sim_start, hw=args.hw,
+                                repeat=args.sim_repeat, ladder=args.sim_ladder)
+    elif args.stdin:
+        source = PipeSource(state, args.range_v)
     else:
         source = SerialSource(args.port, state, args.range_v,
                               start_stream=not args.no_stream_command)
@@ -1513,8 +2170,9 @@ def main(argv=None):
 
     url = 'http://%s:%d/' % ('localhost' if args.host in ('0.0.0.0', '::') else args.host,
                              args.http_port)
-    print('live_plot: source = %s' % ('simulator (signal_model.py)' if args.sim
-                                      else args.port))
+    what = ('the bench harness, its own verdicts' if args.sim
+            else 'stdin (board text)' if args.stdin else args.port)
+    print('live_plot: source = %s' % what)
     print('live_plot: rolling window %.2f s, %d points kept (%.1f s) - the page\'s '
           'slider goes down to %.1f s'
           % (state.window_sec, state.window, state.keep_sec, MIN_VIEW_SEC))
@@ -1530,10 +2188,15 @@ def main(argv=None):
     except KeyboardInterrupt:
         print('\nlive_plot: stopping...')
     except OSError as exc:
-        print('live_plot: could not start %s: %s'
-              % ('the simulator' if args.sim else args.port, exc), file=sys.stderr)
-        print('live_plot: is another monitor holding the port?  (--sim needs no '
-              'board at all)', file=sys.stderr)
+        print('live_plot: could not start %s: %s' % (what, exc), file=sys.stderr)
+        if args.sim:
+            print('live_plot: test/run_tests.ps1 builds the harness the same way it '
+                  'needs to be run (its MinGW C++ runtime on PATH).', file=sys.stderr)
+        elif args.stdin:
+            print('live_plot: the pipeline is closed - feed it "test_bench_detect.exe '
+                  '--stream" or a capture file.', file=sys.stderr)
+        else:
+            print('live_plot: is another monitor holding the port?', file=sys.stderr)
         code = 1
     finally:
         if isinstance(source, SerialSource) and source.fh is not None \

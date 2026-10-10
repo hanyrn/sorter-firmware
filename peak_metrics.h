@@ -26,24 +26,43 @@ enum PeakRejectReason : uint8_t {
     REASON_WIDTH_TOO_NARROW = 2, // event too brief (fewer than min_width_samples)
     REASON_WIDTH_TOO_WIDE   = 3, // event never returned to the noise band (timeout)
     REASON_AREA_TOO_SMALL   = 4, // integrated area below the minimum
-    REASON_SHORT_FOR_HEIGHT = 5, // width too short *for its height* (spike/glitch)
+    REASON_SHORT_FOR_HEIGHT = 5, // leading edge too short/too steep for its height:
+                                 // a step (spike / flat glitch), not a peak
     REASON_RAILED           = 6, // input was at/above the converter rail (saturated),
                                  // so the reading is meaningless rather than a peak
 };
 
 struct PeakMetrics {
     uint32_t index;         // sequential event number (0,1,2,...)
-    uint32_t start_us;      // timestamp when the signal first crossed the on-threshold
+    uint32_t start_us;      // the event's first sample: where the signal left its noise
+                            // band (baseline + k_off*noise), which is the opening edge of
+                            // the window the event's width is measured over
     uint32_t peak_us;       // timestamp of the maximum
-    uint32_t width_us;      // total event duration in microseconds (start -> return)
-    uint32_t width_samples; // total event duration in samples
+    uint32_t width_us;      // the EXCURSION in microseconds: start -> the return to the
+    uint32_t width_samples; // off-threshold, i.e. the span the measurement saw (the
+                            // window the aggregator measures every other channel
+                            // inside).  This is not the event's duration - see
+                            // duration_us/duration_samples below
+    uint32_t duration_us;      // the event's DURATION: the width the bounds are judged
+    uint32_t duration_samples; // with and the number reported as the channel's width.
+                               // The excursion above, corrected for the pulse's own
+                               // envelope (EventDetector::envelopeDuration), because a
+                               // faint pulse is cut off high up its flanks and its
+                               // excursion under-reads its length by up to 40%.  Never
+                               // shorter than the excursion it came from
     uint32_t samples;       // number of samples that were inside the event
+    uint32_t rise_samples;  // samples from the event start to the maximum, i.e. the
+                            // length of the leading edge (0 = the first sample IS the
+                            // top: a step)
 
     int32_t  baseline;      // frozen baseline at the moment the event started
     int32_t  noise;         // frozen noise level (standard deviation) at event start
     int32_t  threshold;     // detection threshold that was used (baseline + k_on*noise)
 
-    int32_t  max_value;     // peak amplitude above the baseline (per-channel counts)
+    int32_t  max_value;     // peak amplitude above the baseline (per-channel counts).
+                            // This is the *supported* apex: the signal was filtered on
+                            // the way in (see ImpulseFilter), so a single-sample noise
+                            // impulse can never be the value reported here.
     int32_t  max_abs_value; // absolute value of the peak (baseline + max_value)
     uint64_t area;          // integral of (signal - baseline) over the event
 
@@ -76,8 +95,16 @@ enum MetricMode : uint8_t {
 // Per-channel bits of ChannelMetrics::flags.
 enum ChannelFlag : uint8_t {
     CH_FLAG_PRESENT   = 0x01, // channel rose above its own on-threshold in the window
-    CH_FLAG_TRUNCATED = 0x02, // the window ended while the channel was still high
-                              // (LINKED), or closed by the max_width guard (PER_CHANNEL)
+    CH_FLAG_TRUNCATED = 0x02, // the window ended while this channel was still well
+                              // inside its excursion: it had not dropped back below
+                              // its own off-threshold for end_debounce consecutive
+                              // samples, and at the window's last sample it was still
+                              // half its hysteresis band above that threshold
+                              // (LINKED), or the detector's max_width guard closed it
+                              // (PER_CHANNEL).  Its peak was cut off, not measured.
+                              // A channel whose tail merely trails the primary's by a
+                              // few counts (two modules, one waveform) is NOT flagged:
+                              // see accumulate() in event_aggregator.h.
     CH_FLAG_RAILED    = 0x04, // this channel's input was saturated (see REASON_RAILED);
                               // its detector was re-baselined and held off briefly
 };
@@ -102,7 +129,8 @@ struct ChannelMetrics {
 // One closed event: the window, plus how many channel records follow.
 struct EventBundle {
     uint32_t index;         // sequential event number (0,1,2,...)
-    uint32_t start_us;      // window start (reference channel crossing)
+    uint32_t start_us;      // window start (the primary's opening edge: where it left its
+                            // noise band - see PeakMetrics::start_us above)
     uint32_t end_us;        // window end
     uint32_t width_samples; // window width in samples
     uint32_t width_us;      // window width in microseconds

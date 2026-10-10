@@ -2,6 +2,14 @@
 """
 Algorithm model-check for EventAggregator in event_aggregator.h.
 
+It mirrors the C++ aggregator's window rules - the primary's band breakout opening the
+shared window, the primary's own close ending it, and a breakout that never became an
+event dropping it again - plus the per-channel records, including the rule that every
+channel inherits the primary's judged *duration* rather than the window it was measured
+inside.  What it does not mirror is the four-phase detector underneath (see the REWORK
+NOTE in model_check.py), so its counts on a noisy stream can still differ:
+test/test_event_aggregator.cpp is authoritative where the two disagree.
+
 This is a 1:1 mirror of the C++ aggregator (LINKED and PER_CHANNEL), built on top
 of the EventDetector mirror in model_check.py so both files always agree.  It
 validates the window/group logic and the per-channel records when no C++ compiler
@@ -54,8 +62,12 @@ def apply_input_polarity(channels, invert_mask):
             channels[ch] = -channels[ch]
 
 
-def classify_peak(cfg, max_value, width_samples, area):
-    """Mirror of EventDetector::classifyPeak()."""
+def classify_peak(cfg, max_value, width_samples, area, rise_samples):
+    """Mirror of EventDetector::classifyPeak().
+
+    `rise_samples` is the length of the leading edge (event start -> maximum); the
+    two shape guards judge that edge, not the average slope over the whole width.
+    """
     if max_value < cfg.min_max_value:
         return mc.REASON_MAX_TOO_SMALL
     if width_samples < cfg.min_width_samples:
@@ -64,8 +76,8 @@ def classify_peak(cfg, max_value, width_samples, area):
         return mc.REASON_WIDTH_TOO_WIDE
     if area < cfg.min_area:
         return mc.REASON_AREA_TOO_SMALL
-    slope = max_value / (width_samples if width_samples else 1)
-    if slope > cfg.max_slope:
+    rise = rise_samples if rise_samples else 1     # 0 = a vertical edge
+    if rise < cfg.min_rise_samples or max_value / rise > cfg.max_slope:
         return mc.REASON_SHORT_FOR_HEIGHT
     return mc.REASON_OK
 
@@ -102,11 +114,18 @@ class EventAggregator:
     def reset(self):
         self.counter = 0
         self.det = [mc.EventDetector(self.cfg.detector) for _ in range(MAX_CH)]
+        # Each channel's input stage (mirrors ImpulseFilter in event_detector.h): the
+        # window measures the same impulse-free stream the detectors judge.
+        self.filt = [mc.ImpulseFilter(self.cfg.detector.impulse_filter_taps)
+                     for _ in range(MAX_CH)]
         self.win_open = False
         z = [0] * MAX_CH
         self.win_base, self.win_on, self.win_off = list(z), list(z), list(z)
         self.win_max, self.win_area = list(z), list(z)
+        self.win_max_ix, self.win_rose_ix = list(z), list(z)
         self.win_rose, self.win_high = [False] * MAX_CH, [False] * MAX_CH
+        self.win_below = [0] * MAX_CH
+        self.win_back = [False] * MAX_CH
         self.pc_pending = 0
         self.pc_start_us = 0
         self.pc_start_ix = 0
@@ -123,6 +142,13 @@ class EventAggregator:
         return (self.cfg.channel_mask & (1 << ch)) != 0
 
     def update(self, channels, t_us, index):
+        # ---- input conditioning: the impulse filter of every masked channel ----
+        # (mirrors EventAggregator::update(): fed unconditionally, even for a channel
+        # that is railed or held out of detection, so it always follows the stream)
+        for ch in range(MAX_CH):
+            if self.in_mask(ch):
+                self.filt[ch].step(channels[ch])
+
         # ---- saturation ("rail") guard: runs before any detection -------------
         rail_new = False     # a channel was declared railed on THIS sample
         any_busy = False     # some channel is currently railed / held off
@@ -191,26 +217,34 @@ class EventAggregator:
         if self.rail_skip[self.primary]:
             return None
 
-        was_in = self.det[self.primary].state == mc.EVENT
+        was_in = self.det[self.primary].in_event()
         ref = self.det[self.primary].update(channels[self.primary], t_us, index)
-        now_in = self.det[self.primary].state == mc.EVENT
+        now_in = self.det[self.primary].in_event()
 
         if not self.win_open:
             if not was_in and now_in:
+                # The primary's window just opened - it left its noise band on this
+                # sample, which is where the event it may become starts (see
+                # EventDetector::in_event()).
                 self.open_window()
-                self.accumulate(self.primary, channels[self.primary])
+                self.accumulate(self.primary, self.filt[self.primary].value, index)
             return None
 
         for ch in range(MAX_CH):
             if self.in_mask(ch):
-                self.accumulate(ch, channels[ch])
+                self.accumulate(ch, self.filt[ch].value, index)
 
-        if ref is None:
-            return None
+        if ref is not None:
+            # The primary's event closed: that is the end of the window for everybody.
+            rec = self.build_linked_record(ref)
+            self.win_open = False
+            return rec
 
-        rec = self.build_linked_record(ref)
-        self.win_open = False
-        return rec
+        # The primary is out of its window and closed no event: what opened it was a band
+        # breakout that never became one, so the window goes with the detector's.
+        if was_in and not now_in:
+            self.win_open = False
+        return None
 
     def open_window(self):
         for ch in range(MAX_CH):
@@ -218,24 +252,62 @@ class EventAggregator:
             self.win_area[ch] = 0
             self.win_rose[ch] = False
             self.win_high[ch] = False
+            self.win_max_ix[ch] = 0
+            self.win_rose_ix[ch] = 0
+            self.win_below[ch] = 0
+            self.win_back[ch] = False
             if not self.in_mask(ch):
                 continue
-            base = self.det[ch].mean
+            base = rint(self.det[ch].mean)
             sigma = self.det[ch].sigma
-            self.win_base[ch] = rint(base)
+            self.win_base[ch] = base
+            # The same expressions the detector uses when its own event begins (the
+            # rounded baseline, thresholds off it), so a channel the detector closed is
+            # also seen as closed here - see openWindow() in event_aggregator.h.
             self.win_on[ch] = rint(base + self.cfg.detector.k_on * sigma)
             self.win_off[ch] = rint(base + self.cfg.detector.k_off * sigma)
         self.win_open = True
 
-    def accumulate(self, ch, x):
+    def accumulate(self, ch, x, index):
         amp = x - self.win_base[ch]
         if amp > self.win_max[ch]:
             self.win_max[ch] = amp
+            self.win_max_ix[ch] = index
         if amp > 0:
             self.win_area[ch] += amp
-        if not self.win_rose[ch] and x > self.win_on[ch]:
-            self.win_rose[ch] = True
-        self.win_high[ch] = x >= self.win_off[ch]
+        if not self.win_rose[ch]:
+            # First crossing inside the window: the channel joins the measurement here
+            # and the leading edge is counted from this sample.
+            if x > self.win_on[ch]:
+                self.win_rose[ch] = True
+                self.win_rose_ix[ch] = index
+                self.win_below[ch] = 0
+                self.win_back[ch] = False
+        elif self.win_back[ch] and x > self.win_on[ch]:
+            # Closed, then crossed again: the window holds a *new* excursion now.
+            self.win_below[ch] = 0
+            self.win_back[ch] = False
+        # CH_FLAG_TRUNCATED = the window ended while the channel was still well inside
+        # its (latest) excursion.  "Back down" needs end_debounce consecutive samples
+        # below the off-threshold (exactly the detector's own end rule) and then
+        # latches, so a noise run at the window's edge cannot reopen an excursion that
+        # finished inside the window.
+        if self.win_rose[ch] and not self.win_back[ch]:
+            if x < self.win_off[ch]:
+                if self.win_below[ch] < self.cfg.detector.end_debounce:
+                    self.win_below[ch] += 1
+                if self.win_below[ch] >= self.cfg.detector.end_debounce:
+                    self.win_back[ch] = True
+            else:
+                self.win_below[ch] = 0
+        # "Well inside", i.e. at the last sample still half its own hysteresis band
+        # above the off-threshold - not merely a count above it.  The two AD7606
+        # modules are separate converters: the same waveform crosses their
+        # off-thresholds a few samples apart, and without this margin each event
+        # would flag the channel whose tail happens to sit higher.
+        band = (self.win_on[ch] - self.win_off[ch]) // 2
+        self.win_high[ch] = (self.win_rose[ch] and not self.win_back[ch]
+                             and x > self.win_off[ch] + band)
 
     def build_linked_record(self, ref):
         chans = []
@@ -247,15 +319,25 @@ class EventAggregator:
                 flags |= CH_FLAG_PRESENT
                 if self.win_high[ch]:
                     flags |= CH_FLAG_TRUNCATED
+                # This channel's own leading edge inside the window: from the sample
+                # it crossed its on-threshold to the sample it peaked at.  A maximum
+                # that came before the crossing (only the tail of that channel was
+                # captured) counts as a step, i.e. 0.
+                rise = (self.win_max_ix[ch] - self.win_rose_ix[ch]
+                        if self.win_max_ix[ch] >= self.win_rose_ix[ch] else 0)
                 reason = classify_peak(self.cfg.detector, self.win_max[ch],
-                                       ref["width_samples"], self.win_area[ch])
+                                       ref["duration_samples"], self.win_area[ch], rise)
             else:
                 reason = mc.REASON_MAX_TOO_SMALL
             chans.append({
                 "channel": ch, "flags": flags, "reason": reason,
                 "baseline": self.win_base[ch], "max_value": self.win_max[ch],
-                "width_samples": ref["width_samples"],   # one event, one width
-                "width_us": ref["width_us"], "area": self.win_area[ch],
+                # One event, one width - and it is the *duration* the primary's detector
+                # judged with, not the window: a channel judged here is judged with the
+                # same length the primary's own classifier used, exactly as
+                # buildLinkedRecord() does in event_aggregator.h.
+                "width_samples": ref["duration_samples"],
+                "width_us": ref["duration_us"], "area": self.win_area[ch],
             })
         bundle = {
             "start_us": ref["start_us"],
@@ -281,15 +363,23 @@ class EventAggregator:
                     if self.pc_pending > 0:
                         self.pc_pending -= 1
                 continue
-            was_in = self.det[ch].state == mc.EVENT
+            was_in = self.det[ch].in_event()
             m = self.det[ch].update(channels[ch], t_us, index)
-            if not was_in and self.det[ch].state == mc.EVENT:
+            if not was_in and self.det[ch].in_event():
                 opened |= (1 << ch)
                 self.pc_in[ch] = True
             if m is not None:
                 closed |= (1 << ch)
                 self.pc_metrics[ch] = m
                 self.pc_in[ch] = False
+            elif was_in and not self.det[ch].in_event():
+                # The channel's own window closed without an event: a band breakout that
+                # never became one.  It was never in an event, so it leaves the group (see
+                # update_per_channel() in event_aggregator.h).
+                if self.pc_in[ch]:
+                    self.pc_in[ch] = False
+                    if self.pc_pending > 0:
+                        self.pc_pending -= 1
 
         done = False
         if closed != 0:
@@ -450,11 +540,18 @@ def test_linked():
             failures.append("event %d: mode/primary/valid = %d/%d/%d"
                             % (b["index"], b["mode"], b["primary"], b["valid"]))
         c0, c1, c8 = ch_by_id(rec["ch"], 0), ch_by_id(rec["ch"], 1), ch_by_id(rec["ch"], 8)
+        # One event, one width: every channel inherits the primary's judged duration (the
+        # window widened for the pulse's envelope, see EventDetector::envelope_duration) -
+        # never "the channel width equals the window", which is the number it was measured
+        # *inside* (see buildLinkedRecord in event_aggregator.h).
         for c in (c0, c1, c8):
-            if c["width_samples"] != b["width_samples"]:
-                failures.append("event %d ch%d: width %d != window %d"
+            if c["width_samples"] != c8["width_samples"]:
+                failures.append("event %d ch%d: width %d != %d - one event, one width"
                                 % (b["index"], c["channel"], c["width_samples"],
-                                   b["width_samples"]))
+                                   c8["width_samples"]))
+        if c8["width_samples"] < b["width_samples"]:
+            failures.append("event %d: judged width %d is shorter than the window %d"
+                            % (b["index"], c8["width_samples"], b["width_samples"]))
         if c0["flags"] != CH_FLAG_PRESENT:
             failures.append("event %d ch0: flags 0x%02x, expected PRESENT"
                             % (b["index"], c0["flags"]))
@@ -524,9 +621,9 @@ def test_linked_clip():
     if c0["max_value"] >= c8["max_value"]:
         failures.append("clip: ch0 (%d) not clipped below ch8 (%d)"
                         % (c0["max_value"], c8["max_value"]))
-    if c0["width_samples"] != b["width_samples"]:
-        failures.append("clip: ch0 width %d != window %d"
-                        % (c0["width_samples"], b["width_samples"]))
+    if c0["width_samples"] != c8["width_samples"]:
+        failures.append("clip: ch0 width %d != ch8 width %d - one event, one width"
+                        % (c0["width_samples"], c8["width_samples"]))
     print("LINKED clip: #%d window=%dsmp  ch8 h=%d  ch0 h=%d flags=0x%02x"
           % (b["index"], b["width_samples"], c8["max_value"], c0["max_value"], c0["flags"]))
     return failures
@@ -679,23 +776,36 @@ def test_invert():
         if rec is not None:
             events.append(rec)
 
-    if len(events) != 2:
-        failures.append("invert: %d events, expected 2" % len(events))
+    # The two dips are the peaks under test.  Because the threshold is five sigma of
+    # the *filtered* stream (which has a smaller variance than the raw samples, see
+    # ImpulseFilter), a lone noise excursion can additionally be reported - but only
+    # ever *rejected*: a one-sample excursion has no leading edge for the shape guard
+    # to accept, which is exactly what that guard is for.  So the dips must come out
+    # valid, and anything else must be a shape rejection.
+    valid = [rec for rec in events if rec["bundle"]["valid"] == 1]
+    if len(valid) != 2:
+        failures.append("invert: %d valid events, expected 2 (the two dips)" % len(valid))
     for rec in events:
         b = rec["bundle"]
         c8 = ch_by_id(rec["ch"], 8)
-        if b["valid"] != 1:
-            failures.append("invert: event %d valid=%d, expected 1 (dip -> peak)"
-                            % (b["index"], b["valid"]))
-        if c8 is None or not (600 <= c8["max_value"] <= 1000):
-            failures.append("invert: event %d ch8 height %s, expected ~%d (dip depth)"
-                            % (b["index"], None if c8 is None else c8["max_value"], int(DIP)))
-
+        if b["valid"] == 1:
+            if c8 is None or not (600 <= c8["max_value"] <= 1000):
+                failures.append("invert: event %d ch8 height %s, expected ~%d (dip depth)"
+                                % (b["index"], None if c8 is None else c8["max_value"],
+                                   int(DIP)))
+        elif c8 is None or c8["max_value"] > 0.25 * DIP or \
+                b["reason"] not in (mc.REASON_MAX_TOO_SMALL, mc.REASON_SHORT_FOR_HEIGHT,
+                                    mc.REASON_WIDTH_TOO_NARROW):
+            failures.append("invert: rejected event %d reason=%d height=%s - expected a "
+                            "small noise excursion (max/shape bound)"
+                            % (b["index"], b["reason"],
+                               None if c8 is None else c8["max_value"]))
     print("INVERT: %d events (dips detected as peaks)" % len(events))
     for rec in events:
         b = rec["bundle"]
         c8 = ch_by_id(rec["ch"], 8)
-        print("  #%d valid=%d ch8 h=%d" % (b["index"], b["valid"], c8["max_value"]))
+        print("  #%d valid=%d reason=%d ch8 h=%d"
+              % (b["index"], b["valid"], b["reason"], c8["max_value"]))
     return failures
 
 
