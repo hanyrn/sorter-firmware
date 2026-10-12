@@ -85,6 +85,16 @@ if ($py) {
     if ($py -eq 'py') { $pyArgs = @('-3') + $pyArgs }
     & $py @pyArgs
     if ($LASTEXITCODE -ne 0) { $failed++ }
+
+    # analyze_capture.py measures a capture rather than drawing it (where a detector
+    # window sits on its pulse, whether a channel steps away from the code), so it has
+    # no board to check against here - it builds its own capture with the defects
+    # planted in it and checks the measurements against those.
+    Write-Host '== analyze_capture --selftest (capture measurements) =='
+    $pyArgs = @((Join-Path $here 'analyze_capture.py'), '--selftest')
+    if ($py -eq 'py') { $pyArgs = @('-3') + $pyArgs }
+    & $py @pyArgs
+    if ($LASTEXITCODE -ne 0) { $failed++ }
 } else {
     Write-Host '== stream_check skipped: no Python (py/python) on PATH =='
 }

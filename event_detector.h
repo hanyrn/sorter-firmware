@@ -239,7 +239,7 @@ public:
         // sigma does.  Keeping the gate narrower than the trigger is what stops a
         // signal that sits in the band from feeding the reference indefinitely.
         uint32_t quiet_seed_points  = 128;     // points the quiet period seeds from
-        uint32_t gate_max           = 160;     // gate ceiling in counts; 0 = no ceiling
+        uint32_t gate_max           = 320;     // gate ceiling in counts; 0 = no ceiling
 
         // ---- input conditioning ----
         // Length of the running median in front of the detector: 1 = off, 3 = drop a
@@ -248,7 +248,7 @@ public:
         uint8_t  impulse_filter_taps = 7;
 
         // ---- metric bounds used to judge a closed excursion ------------------
-        int32_t  min_max_value      = 80;      // peak amplitude (counts) must reach this
+        int32_t  min_max_value      = 160;     // peak amplitude (counts) must reach this
         uint32_t min_width_samples  = 35;      // the event's *duration* must be at least
                                                // this many samples.  35 = 3.5 ms at
                                                // 10 kSPS: the shortest event worth
@@ -265,10 +265,10 @@ public:
         // max_slope bounds the *measurement path* (see "Bounded slope" at the top of
         // this file) and doubles as the shape guard in classifyPeak(): no value may be
         // tracked as the apex - and no descent may be read as "back at the baseline" -
-        // if the signal moved faster than this.  100 counts/sample = 1e6 counts/s at
-        // 10 kSPS: 5x the fastest edge a real event can have (500 counts in 5 ms) and
-        // far below what a spike does (750 counts in a single sample).
-        float    max_slope          = 100.0f;
+        // if the signal moved faster than this.  200 counts/sample = 2e6 counts/s at
+        // 10 kSPS: 5x the fastest edge a real event can have (1000 counts in 5 ms) and
+        // far below what a spike does (1500 counts in a single sample).
+        float    max_slope          = 200.0f;
     };
 
     EventDetector() { reset(); }
@@ -310,8 +310,8 @@ public:
                 // baseline, but a faint peak's whole lower flank is *inside* that gate (the
                 // band opens at k_off < k_gate sigma), so a peak that never leaves the band
                 // would feed its own rise into sigma: measured on the floor ladder at 600
-                // samples, sigma walks 13.5 -> 19.2 counts across one 60-count rung, which
-                // lifts the trigger (5 sigma) from +68 to +96 counts - above that rung's own
+                // samples, sigma walks 27 -> 38.4 counts across one 120-count rung, which
+                // lifts the trigger (5 sigma) from +136 to +192 counts - above that rung's own
                 // apex, so it is never crossed.  Once the window opens, the excursion is the
                 // signal and must not decide the *noise*: sigma is left alone until the
                 // trace is back in the band.  The mean, though, keeps tracking (same gate):
@@ -668,7 +668,7 @@ public:
         // measurement path (measure() clips anything faster), so it bites on the
         // values EventAggregator measures inside a window - and it is what used to be
         // missing when the average slope over the whole width was judged instead: a
-        // 6-sample rectangle of 500 counts averages 83 counts/sample, i.e. it looked
+        // 6-sample rectangle of 1000 counts averages 167 counts/sample, i.e. it looked
         // "slow enough" although it rises instantly.
         const uint32_t rise = rise_samples ? rise_samples : 1u;   // 0 = vertical edge
         if (rise < cfg.min_rise_samples)           { return REASON_SHORT_FOR_HEIGHT; }

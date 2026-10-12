@@ -61,6 +61,7 @@ does the **M7 pass first, then the M4 pass**, and why `-Split` exists.
 | `test/plot_signals.py` | Plots the AD7606 input waveform + detector verdicts (SVG/HTML, no deps) |
 | `test/live_plot.py` | Live viewer for the serial sample stream (`T` command) in the browser; `--sim` draws the bench harness's own firmware verdicts instead of a Python mirror, and `--sim-ladder` swaps the random train for the floor ladder - the isolated near-baseline staircase the pane's own scale can show |
 | `test/stream_check.py` | Contract check for the harness → viewer text protocol: runs `test_bench_detect.exe --stream` (and again with `--ladder`, where the report must stay off the stream), feeds its stdout through `live_plot.py`'s own parser and fails on any line, count or window the viewer stopped understanding |
+| `test/analyze_capture.py` | Measures a `live_plot.py --log` capture instead of drawing it: where each detector window sits on the pulse it describes (an origin bug and a late detector look alike on the page), and whether a channel *steps* away from the DAC code written for it - with the step compared against the powers of two, which is what tells one data line from an input network - whether one column *reads the other's word with a bit held* (a stuck or loose data line, named with its module, bit and GIGA pin from `config.h`), and whether the fitted counts/code match the ±5 V or the ±10 V RANGE strap the build was made for. `--selftest` builds a capture with those defects planted in it |
 | `test/test_event_detector.cpp` | C++ unit test for the detector (host) |
 | `test/test_event_aggregator.cpp` | C++ unit test for the aggregator (host) |
 | `test/test_signal_model.cpp` | C++ unit test for `signal_model.h` (host) |
@@ -599,7 +600,20 @@ validated without the board:
   second at most), and widening it redraws from the `--history` seconds (8 by default,
   capped at 60) each trace keeps, without waiting for new samples. Pure stdlib plus your
   browser: no `pyserial`, no npm. Ctrl+C sends `T0` so the 1000 lines/s flood stops again
-  (`--keep-streaming` leaves it running).
+  (`--keep-streaming` leaves it running), and the script waits for the board to go quiet
+  before it hangs up.
+
+  On the board's own USB port (`--port COMx`) it configures the port the way a monitor
+  does - 115200 8N1 and **DTR** - because the GIGA's USB CDC is the mbed `USBCDC` that
+  ships with the Arduino core: its read *and* write paths give up until the host asserts
+  DTR (`if (!serial->_terminal_connected) { result = false; ... }` in
+  `cores/arduino/USB/USBCDC.cpp`), and a bare `open()` never does - which is what an
+  empty page feeding on a perfectly healthy board was. The same class also parks the
+  M7's loop inside `Serial.print` when the host stops reading in the middle of a
+  transfer: the board then answers nothing at all - no heartbeat, no `T`, and `--port`
+  stays empty - until it is re-enumerated, so **press RESET** (or unplug/replug the USB
+  cable) before suspecting the wiring. `. \monitor.ps1` and the IDE's monitor assert DTR
+  too, which is why `T` + Enter there always worked.
 
   `--sim` runs the **firmware**, not a mirror of it. It starts
   `test/test_bench_detect.exe --stream` (built by `test/run_tests.ps1`), which drives
@@ -656,6 +670,79 @@ validated without the board:
   saved monitor session reviewable after the fact:
   `test\test_bench_detect.exe --stream | py -3 test\live_plot.py --stdin`.
   `--window`, `--history`, `--range`, `--channels` and `--http-port` tune the view.
+
+  `--log FILE` writes everything the source produced, verbatim and unbuffered, so a run
+  outlives the page: that file replays through `--stdin` exactly like a monitor capture,
+  and `test\analyze_capture.py` *measures* it. That tool exists because two of the
+  things an eye reads off this page are questions of numbers rather than of shape, and
+  the page cannot answer either - so it prints the measurement:
+
+  ```powershell
+  py -3 test\live_plot.py --port COM6 --log run.txt     # reproduce, Ctrl+C when done
+  py -3 test\analyze_capture.py run.txt
+  py -3 test\analyze_capture.py run.txt --channel 0 --events 12 --min-run 1
+  ```
+
+  * **where a detector window sits on its pulse.** The window is stamped in microseconds
+    (the M4's clock) while the `S,` lines carry loop sample indices, and the page maps
+    one onto the other with `us * 10 kSPS / 1e6`. That identity holds only if the stamps
+    start at 0 with sample 0: `test_bench_detect.cpp` has always stamped `i * kDtUs` and
+    `sorter-firmware.ino` now does too (`sampleStampUs()`). A board built before that
+    change stamped `micros()` - *uptime*, whose first sample already carried the loop's
+    own start-up - so every window was drawn that far to the **right** of the peak it
+    described, at both ends. The tool prints the median and the spread of
+    (window centre − pulse centre): a large median with a small spread is that origin, a
+    scattered one is the detector's own, and the odd window that simply swallowed two
+    pulses is named with its span because it is neither;
+  * **whether a channel steps away from the code written for it.** It fits
+    `counts = a*code + b` per channel (robustly, and at the lag the channel really
+    follows the code by, which it prints in points and ms), then scans the residual for
+    deviations that *hold* for several points. A step is a level shift, a lone point is a
+    spike (`--min-run 1` shows those too). A step of `±2^k` counts is **one data line** -
+    module 0's DB0..DB15 are latched first, closest to the RD edge and furthest up the
+    ribbon, so a marginal contact or too short an `AD7606_TACC_NS` shows on channel 0 of
+    module 0 before anywhere else - while a deviation that fits no power of two is a
+    *shape* (an input network not settling, or the DAC's own output stage), which no
+    cable will fix.
+
+  * **whether one column reads the other's word with one bit held.** The two modules sit
+    on one bus and, in the bench loopback, on the *same* input, so the two words should
+    be the same word - count for count, within the noise, they are. (A slope difference
+    the fits show is the held bit skewing them; `lines` is the honest read.) When they
+    are not, the tool models one word as "the other with bit k forced to a level" and
+    keeps the model only if it explains *both* the points where that bit already sits at
+    that level and the ones where forcing it changes the word by 2^k. That two-regime
+    test is the whole difference between a **data line** and a **voltage**: a fixed
+    offset of 2^k counts explains one regime and fails the other, and the plain word
+    comparison already explains a pair that merely matches. A bit that passes names the
+    wire -
+
+    ```
+    ch0 vs ch8: bit 12 is held at 1 - 13135 point(s) (91.2%) read 4096 counts high where
+                the shared input's bit 12 is clear, and the 1186 point(s) (8.2%) where it
+                is set follow exactly: 2^12 = 4096 counts.
+                -> module 0 DB12 = GIGA D34 (config.h AD7606_DB_LINES[12])
+    ```
+
+    And when the same bit also reads the input correctly on a few points, the tool says
+    so, because a line that lets go is *loose* (a ribbon or header contact) rather than
+    shorted. `--channel 0` prints that a single-channel capture cannot show a held bit at
+    all: it needs a second column carrying the same input;
+
+  * **whether the fitted counts/code match the strap the build was made for.** The fit's
+    slope *is* `SIGNALGEN_ADC_PER_DAC` measured off the wire, and the two RANGE straps
+    are a factor of two apart (2.64 / 5.28), so the tool prints the measured slope beside
+    both and names the strap the board is really in. A build made for ±10 V on a ±5 V
+    board is otherwise invisible on the page - every *relative* number still looks right
+    while `DET_MIN_MAX_VALUE`, `DET_MIN_AREA` and `DET_MAX_SLOPE` are all off by that
+    factor (see *Levels*, below);
+
+  * **the planted defects.** `--selftest` plants a known step, a known one-point lag,
+    a known stamp origin, a known held bit (high and low), an offset of exactly 2^12
+    counts - which must *not* be called a line - and both straps' gains in a synthetic
+    capture, and checks the measurements against them;
+    `test\run_tests.ps1` runs it along with the rest.
+
   `--range` picks the AD7606 strap the page's volts labels and `expected waveform`
   scale are read with (`SIGNALGEN_ADC_PER_DAC`: 2.64 at ±10 V, 5.28 at ±5 V), which is
   also where the COM-port path's counts come from; the `--sim`/`--stdin` counts come out
@@ -701,7 +788,12 @@ tick **full scale**
   duration, so the band, the edges and `w=` are all the same measurement; with per-channel
   metrics a channel may be narrower than its group window, and the tag then adds
   `(exc Nsmp)`. The window's microsecond
-  stamp is converted at the stream's sample rate, and a window narrower than
+  stamp is converted at the stream's sample rate - it is stamped on the *sample grid*
+  the samples themselves are counted on (`sampleStampUs()` in `sorter-firmware.ino`,
+  `i * kDtUs` in the harness), so a window lands on the samples it measured; a board
+  built before that stamped `micros()` instead and drew every window as far right of its
+  peak as the acquisition loop's own uptime, which is what
+  `test\analyze_capture.py` measures - and a window narrower than
   `SORTER_STREAM_DECIM` samples can fall between two plotted points - the tag still
   reports what the detector measured.
 
@@ -878,7 +970,10 @@ baseline**, so peaks are positive excursions — exactly what the detector's
   full scale describe a different strap than the hardware is in.
 * `SIGNALGEN_ADC_PER_DAC` (2.64 for ±10 V, 5.28 for ±5 V) converts injected
   AD7606 counts into DAC codes. If the printed `max=` values are off by a constant
-  factor, correct this number rather than the pattern.
+  factor, correct this number rather than the pattern. That factor is also measurable off
+  a saved capture: `test\analyze_capture.py` fits the counts against the DAC code, prints
+  the slope beside both straps' `SIGNALGEN_ADC_PER_DAC` and names the one the *board* is
+  in, so a build and a board that disagree about RANGE are named rather than guessed.
 * **The loopback cannot saturate the ADC**: the most the DAC can produce is its own
   clamp, `(SIGNALGEN_MAX_CODE - SIGNALGEN_BASELINE_CODE) * SIGNALGEN_ADC_PER_DAC` ≈
   **4757 counts** above the baseline at ±10 V. The tallest peaks therefore come back
@@ -899,7 +994,10 @@ baseline**, so peaks are positive excursions — exactly what the detector's
    means the DAC output is not reaching the ADC input. (The generator's own
    `BASELINE_WAVE_*` drift moves that figure ±396 counts over 30 s, so anything in
    5000-5800 is the wander, not a fault - it is slow enough that no bound can
-   mistake it for a peak, and `base=` should follow it rather than step.)
+   mistake it for a peak, and `base=` should follow it rather than step.) Both driven
+   channels are written the same code, so `ch0` and `ch8` must **track each other** to
+   within noise: one of them sitting ~4096 counts away from the other is a data line, not
+   a level, and `test\analyze_capture.py` names the bit and the GIGA pin behind it.
 4. **Watch one 2 s pattern cycle** (20 000 samples at 10 kSPS). Every cycle draws a
    *new* pulse train (`SIGNALGEN_*` in `config.h`), so the log lines differ from cycle
    to cycle - that is the point. Over a couple of cycles you should see:

@@ -513,12 +513,12 @@ def test_linked():
     cfg.primary = 8
 
     def levels(i, gauss):
-        base0 = 2000.0 + gauss() * 5.0
-        base1 = 2000.0 + gauss() * 5.0
-        base8 = 2000.0 + gauss() * 5.0
+        base0 = 2000.0 + gauss() * 10.0
+        base1 = 2000.0 + gauss() * 10.0
+        base8 = 2000.0 + gauss() * 10.0
         for c in (6000, 13000, 20000):
-            base8 += gaussian_peak(i, c, 200, 800.0)      # primary
-            base0 += gaussian_peak(i, c, 200, 400.0)      # same shape, half height
+            base8 += gaussian_peak(i, c, 200, 1600.0)     # primary
+            base0 += gaussian_peak(i, c, 200, 800.0)      # same shape, half height
         return {0: base0, 1: base1, 8: base8, 2: 5000.0}  # ch2: not in the mask
 
     agg = EventAggregator(cfg)
@@ -555,11 +555,11 @@ def test_linked():
         if c0["flags"] != CH_FLAG_PRESENT:
             failures.append("event %d ch0: flags 0x%02x, expected PRESENT"
                             % (b["index"], c0["flags"]))
-        if not 250 <= c0["max_value"] <= 550:
-            failures.append("event %d ch0: height %d, expected ~400"
+        if not 500 <= c0["max_value"] <= 1100:
+            failures.append("event %d ch0: height %d, expected ~800"
                             % (b["index"], c0["max_value"]))
-        if not 650 <= c8["max_value"] <= 950:
-            failures.append("event %d ch8: height %d, expected ~800"
+        if not 1300 <= c8["max_value"] <= 1900:
+            failures.append("event %d ch8: height %d, expected ~1600"
                             % (b["index"], c8["max_value"]))
         if c0["max_value"] >= c8["max_value"]:
             failures.append("event %d: ch0 (%d) not smaller than ch8 (%d)"
@@ -570,8 +570,8 @@ def test_linked():
         if c1["flags"] != 0 or c1["reason"] != mc.REASON_MAX_TOO_SMALL:
             failures.append("event %d ch1: flags 0x%02x reason %d, expected absent"
                             % (b["index"], c1["flags"], c1["reason"]))
-        if not 0 <= c1["max_value"] < 80:
-            failures.append("event %d ch1: height %d, expected noise only (<80)"
+        if not 0 <= c1["max_value"] < 160:
+            failures.append("event %d ch1: height %d, expected noise only (<160)"
                             % (b["index"], c1["max_value"]))
 
     print("LINKED: %d events" % len(events))
@@ -595,11 +595,11 @@ def test_linked_clip():
     cfg.primary = 8
 
     def levels(i, gauss):
-        base0 = 2000.0 + gauss() * 5.0
-        base1 = 2000.0 + gauss() * 5.0
-        base8 = 2000.0 + gauss() * 5.0
-        base8 += gaussian_peak(i, 6000, 200, 800.0)   # primary: window 5450..6600
-        base0 += gaussian_peak(i, 7000, 200, 800.0)   # arrives after the window closes
+        base0 = 2000.0 + gauss() * 10.0
+        base1 = 2000.0 + gauss() * 10.0
+        base8 = 2000.0 + gauss() * 10.0
+        base8 += gaussian_peak(i, 6000, 200, 1600.0)  # primary: window 5450..6600
+        base0 += gaussian_peak(i, 7000, 200, 1600.0)  # arrives after the window closes
         return {0: base0, 1: base1, 8: base8}
 
     agg = EventAggregator(cfg)
@@ -615,8 +615,8 @@ def test_linked_clip():
     c8 = ch_by_id(rec["ch"], 8)
     if c0["flags"] != (CH_FLAG_PRESENT | CH_FLAG_TRUNCATED):
         failures.append("clip: ch0 flags 0x%02x, expected PRESENT|TRUNCATED" % c0["flags"])
-    if not 0 < c0["max_value"] < 300:
-        failures.append("clip: ch0 height %d, expected the window edge (~100)"
+    if not 0 < c0["max_value"] < 600:
+        failures.append("clip: ch0 height %d, expected the window edge (~200)"
                         % c0["max_value"])
     if c0["max_value"] >= c8["max_value"]:
         failures.append("clip: ch0 (%d) not clipped below ch8 (%d)"
@@ -642,12 +642,12 @@ def test_per_channel():
         base0 = 2000.0 + gauss() * 5.0
         base1 = 2000.0 + gauss() * 5.0
         base8 = 2000.0 + gauss() * 5.0
-        base9 = 2000.0 + gauss() * 5.0
+        base9 = 2000.0 + gauss() * 10.0
         for c in (6000, 13000):
-            base0 += gaussian_peak(i, c, 200, 800.0)         # broad
-            base1 += gaussian_peak(i, c + 100, 60, 600.0)    # narrow, inside ch0
-            base8 += gaussian_peak(i, c + 20, 150, 700.0)
-            base9 += gaussian_peak(i, c - 30, 100, 500.0)
+            base0 += gaussian_peak(i, c, 200, 1600.0)        # broad
+            base1 += gaussian_peak(i, c + 100, 60, 1200.0)   # narrow, inside ch0
+            base8 += gaussian_peak(i, c + 20, 150, 1400.0)
+            base9 += gaussian_peak(i, c - 30, 100, 1000.0)
         return {0: base0, 1: base1, 8: base8, 9: base9}
 
     agg = EventAggregator(cfg)
@@ -682,8 +682,8 @@ def test_per_channel():
         if b["width_samples"] < c0["width_samples"]:
             failures.append("event %d: window %d narrower than ch0 %d"
                             % (b["index"], b["width_samples"], c0["width_samples"]))
-        if not 550 <= c1["max_value"] <= 700:
-            failures.append("event %d ch1: height %d, expected ~600"
+        if not 1000 <= c1["max_value"] <= 1400:
+            failures.append("event %d ch1: height %d, expected ~1200"
                             % (b["index"], c1["max_value"]))
         if c1["area"] <= 0 or c1["area"] >= c0["area"]:
             failures.append("event %d: ch1 area %d vs ch0 area %d"
@@ -709,13 +709,13 @@ def test_rail():
     cfg.primary = 8
 
     def levels(i, gauss):
-        base0 = 2000.0 + gauss() * 5.0
-        base1 = 2000.0 + gauss() * 5.0
-        base8 = 2000.0 + gauss() * 5.0
+        base0 = 2000.0 + gauss() * 10.0
+        base1 = 2000.0 + gauss() * 10.0
+        base8 = 2000.0 + gauss() * 10.0
         if 4000 <= i < 4200:                       # bright burst: ch8 saturates
             base8 = 32700.0
         if 8000 <= i < 10000:                      # a normal peak after recovery
-            base8 += gaussian_peak(i, 9000, 200, 800.0)
+            base8 += gaussian_peak(i, 9000, 200, 1600.0)
         return {0: base0, 1: base1, 8: base8}
 
     agg = EventAggregator(cfg)
@@ -759,10 +759,10 @@ def test_invert():
     cfg.channel_mask = (1 << 8)
     cfg.primary = 8
 
-    DIP = 800.0
+    DIP = 1600.0
 
     def levels(i, gauss):
-        v = 25000.0 + gauss() * 5.0                 # idles HIGH ...
+        v = 25000.0 + gauss() * 10.0                # idles HIGH ...
         for c in (6000, 13000):
             v -= gaussian_peak(i, c, 200, DIP)      # ... and dips on an event
         return {8: v}
@@ -789,7 +789,7 @@ def test_invert():
         b = rec["bundle"]
         c8 = ch_by_id(rec["ch"], 8)
         if b["valid"] == 1:
-            if c8 is None or not (600 <= c8["max_value"] <= 1000):
+            if c8 is None or not (1200 <= c8["max_value"] <= 2000):
                 failures.append("invert: event %d ch8 height %s, expected ~%d (dip depth)"
                                 % (b["index"], None if c8 is None else c8["max_value"],
                                    int(DIP)))

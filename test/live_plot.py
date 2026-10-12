@@ -19,6 +19,7 @@ build step.
     py -3 test/live_plot.py --sim              # no board: the bench harness runs
     py -3 test/live_plot.py --port COM7        # the real board
     py -3 test/live_plot.py --stdin < bench.txt    # a capture, or a pipe
+    py -3 test/live_plot.py --port COM7 --log run.txt   # ... and save that run
 
 --sim runs the firmware without a board.  It starts test/test_bench_detect.exe
 (built by test/run_tests.ps1) with --stream, which makes the *shipped*
@@ -101,6 +102,12 @@ The page shows
 Ctrl+C stops it.  Because the M7 would otherwise keep flooding the serial monitor
 with 1000 lines/s, the script sends "T0" on the way out (--keep-streaming skips
 that); pressing "T" in a monitor afterwards switches it back on.
+
+--log FILE writes the raw text the source produced, verbatim and unbuffered, so a
+run is not lost when the page is closed: that file replays through --stdin like a
+monitor capture, and test/analyze_capture.py reads it and *measures* the two things
+the page can only show - how far a detector window sits from the pulse it describes,
+and whether a channel deviates from the code that was written for it.
 
 See also test/plot_signals.py: the same signal, offline, with the detector's
 verdicts shaded per event.
@@ -324,11 +331,12 @@ class StreamParser:
     line, so the log pane still reads like a monitor session.
     """
 
-    def __init__(self, state, source, range_v, echo=True):
+    def __init__(self, state, source, range_v, echo=True, tee=None):
         self.state    = state
         self.source   = source
         self.range_v  = range_v
         self.echo     = echo
+        self.tee      = tee                   # --log: raw capture, replayable by --stdin
         self.buf      = ''
         self.gen      = []
         self.cols     = []
@@ -352,6 +360,17 @@ class StreamParser:
         line = line.strip()                  # callers may hand us the raw text
         if not line:
             return
+        if self.tee is not None:
+            # --log: the raw text, before anything is interpreted, so the capture
+            # replays through --stdin exactly like a monitor session would.  Only
+            # whole lines get here (feed_bytes holds the torn tail back), and only
+            # the reader thread writes, so no lock is needed.  A capture that stops
+            # being writable (disk full, file pulled) drops the tee and the stream
+            # goes on.
+            try:
+                self.tee.write(line.encode('ascii', 'replace') + b'\n')
+            except (OSError, ValueError):
+                self.tee = None
         if line.startswith('S,'):
             self.flush_event()               # a sample line ends an open event group
             self._point(line)
@@ -508,8 +527,100 @@ class StreamParser:
 # ===========================================================================
 # Sources - what feeds StreamState
 # ===========================================================================
+def configure_serial_port(fh, baud=115200):
+    """Configure an opened COM port the way a serial monitor does.
+
+    Reading `\\\\.\\COMx` is not enough on a GIGA R1: its USB port is the mbed
+    USBCDC that ships with the Arduino core, and that driver hands nothing over and
+    sends nothing until the host has said hello - both the read and the write path
+    of that class start with
+
+        cores/arduino/USB/USBCDC.cpp:
+        if (!serial->_terminal_connected) { result = false; return true; }
+
+    `_terminal_connected` is set by the CDC SET_CONTROL_LINE_STATE request, i.e. by
+    **DTR** - which is exactly what a serial monitor (or pyserial) asserts on open
+    and what a bare `open()` never does.  Measured on the board: the same firmware
+    that floods `monitor.ps1` at 34 kB/s answered a bare Python `open()` with *zero
+    bytes in five minutes*, so `--port` sat on an empty page while the firmware ran
+    perfectly.  Hence the same two calls a monitor makes: 115200 8N1 through
+    SetCommState (a real UART needs the baud rate anyway) and DTR through
+    EscapeCommFunction, plus the all-zero-timeout read setup that makes an idle read
+    return at once (`_run` below relies on that) rather than block the reader thread.
+
+    Best effort by design: a port that will not configure - a NULL-modem pair, or a
+    POSIX tty, where the kernel raises DTR itself - is left alone, and a warning says
+    so, because "is another monitor holding the port?" is still the answer to a
+    silent stream.
+    """
+    if os.name != 'nt':
+        return                          # POSIX drivers raise DTR on open themselves
+    try:
+        import ctypes
+        import msvcrt
+        from ctypes import wintypes
+
+        class _Dcb(ctypes.Structure):
+            # DCB (winbase.h).  The two bitfield words are packed into one DWORD, in
+            # this order: fBinary fParity fOutxCtsFlow fOutxDsrFlow fDtrControl(2)
+            # fDsrSensitivity fTXContinueOnXoff fOutX fInX fErrorChar fNull
+            # fRtsControl(2) fAbortOnError fDummy2(17).
+            _fields_ = [('DCBlength', wintypes.DWORD),
+                        ('BaudRate', wintypes.DWORD),
+                        ('flags', wintypes.DWORD),
+                        ('wReserved', wintypes.WORD),
+                        ('XonLim', wintypes.WORD),
+                        ('XoffLim', wintypes.WORD),
+                        ('ByteSize', ctypes.c_ubyte),
+                        ('Parity', ctypes.c_ubyte),
+                        ('StopBits', ctypes.c_ubyte),
+                        ('XonChar', ctypes.c_char),
+                        ('XoffChar', ctypes.c_char),
+                        ('ErrorChar', ctypes.c_char),
+                        ('EofChar', ctypes.c_char),
+                        ('EvtChar', ctypes.c_char),
+                        ('wReserved1', wintypes.WORD)]
+
+        class _Timeouts(ctypes.Structure):
+            _fields_ = [('ReadIntervalTimeout', wintypes.DWORD),
+                        ('ReadTotalTimeoutMultiplier', wintypes.DWORD),
+                        ('ReadTotalTimeoutConstant', wintypes.DWORD),
+                        ('WriteTotalTimeoutMultiplier', wintypes.DWORD),
+                        ('WriteTotalTimeoutConstant', wintypes.DWORD)]
+
+        kern = ctypes.WinDLL('kernel32', use_last_error=True)
+        hdl  = wintypes.HANDLE(msvcrt.get_osfhandle(fh.fileno()))
+        dcb  = _Dcb()
+        dcb.DCBlength = ctypes.sizeof(_Dcb)
+        if not kern.GetCommState(hdl, ctypes.byref(dcb)):
+            raise OSError(ctypes.get_last_error(), 'GetCommState')
+        dcb.BaudRate = baud
+        dcb.ByteSize = 8
+        dcb.Parity   = 0
+        dcb.StopBits = 0                # 0 = one stop bit, in the Windows DCB
+        flags = dcb.flags | 0x1         # fBinary
+        flags = (flags & ~(0x3 << 4))  | (0x1 << 4)    # fDtrControl = ENABLE
+        flags = (flags & ~(0x3 << 12)) | (0x1 << 12)   # fRtsControl = ENABLE
+        dcb.flags = flags
+        if not kern.SetCommState(hdl, ctypes.byref(dcb)):
+            raise OSError(ctypes.get_last_error(), 'SetCommState')
+        # MAXDWORD + two zero multipliers: a read returns at once, empty when idle.
+        if not kern.SetCommTimeouts(hdl, ctypes.byref(_Timeouts(0xFFFFFFFF, 0, 0, 0, 0))):
+            raise OSError(ctypes.get_last_error(), 'SetCommTimeouts')
+        if not kern.EscapeCommFunction(hdl, 5):        # 5 = SETDTR
+            raise OSError(ctypes.get_last_error(), 'EscapeCommFunction(SETDTR)')
+    except Exception as exc:            # OSError, ValueError (no real handle), ...
+        print('live_plot: could not configure %s (%s) - a USB CDC board only talks '
+              'to a host that asserts DTR, so the stream may stay empty.'
+              % (getattr(fh, 'name', 'the port'), exc), file=sys.stderr)
+
+
 class SerialSource:
-    """The board: hold COMx open, ask for the stream, read the lines it prints."""
+    """The board: hold COMx open, ask for the stream, read the lines it prints.
+
+    Opening the port is not quite enough - `configure_serial_port()` above has to
+    say "a terminal is here" (DTR) before a GIGA R1's USB CDC will talk at all.
+    """
 
     def __init__(self, port, state, range_v, start_stream=True):
         self.port         = port
@@ -519,6 +630,7 @@ class SerialSource:
         self.fh           = None
         self.thread       = None
         self.stopped      = threading.Event()
+        self.last_rx      = 0.0         # when a byte last arrived (stop() waits on it)
 
     def name(self):
         """Windows wants \\\\.\\COMx once the port number is above COM9."""
@@ -528,8 +640,11 @@ class SerialSource:
         # Raw COMx open, no pyserial: unbuffered, so read() hands over whatever the
         # driver has rather than waiting for a full buffer, and a read that is still
         # waiting when stop() closes the handle raises - the reader thread takes that
-        # as "port gone" and exits.
+        # as "port gone" and exits.  configure_serial_port() then does the part a
+        # monitor does (baud, DTR): a GIGA R1's USB CDC sends *nothing* until DTR is
+        # up, so without it this source reads an empty port forever.
         self.fh = open(self.name(), 'r+b', buffering=0)
+        configure_serial_port(self.fh)
         self.thread = threading.Thread(target=self._run, name='serial', daemon=True)
         self.thread.start()
         if self.start_stream:
@@ -558,11 +673,31 @@ class SerialSource:
                 break
             if data:
                 self.parser.feed_bytes(data)
+                self.last_rx = time.time()
             else:
                 time.sleep(0.002)           # an idle read returns at once
         self.parser.flush()
 
+    def wait_quiet(self, quiet=0.3, limit=2.0):
+        """Wait for the board to stop transmitting, then it is safe to hang up.
+
+        A GIGA's USB CDC parks the M7 loop inside Serial.print when the host stops
+        reading in the middle of a transfer, and after that it answers nothing at all
+        - not even the heartbeat - until it is re-enumerated (press RESET).  Closing
+        only once the driver has run dry, with no transfer left in flight, is what
+        keeps that from happening: `main()` asks for "T0" first, so the quiet is the
+        board's own acknowledgement that it has processed it.
+        """
+        t0 = time.time()
+        while time.time() - t0 < limit:
+            if time.time() - self.last_rx >= quiet:
+                return
+            time.sleep(0.02)
+
     def stop(self):
+        # Drain first (see wait_quiet): 300 ms of silence, at most 2 s of waiting.
+        if self.fh is not None:
+            self.wait_quiet()
         self.stopped.set()
         fh, self.fh = self.fh, None
         if fh is not None:
@@ -2133,7 +2268,13 @@ def main(argv=None):
     view.add_argument('--no-open', action='store_true',
                       help='do not open a browser')
     view.add_argument('--keep-streaming', action='store_true',
-                      help='leave the board streaming on exit (no "T0")')
+                      help='leave the board streaming on exit (no "T0"); on a '
+                           "GIGA's own USB CDC, hanging up mid-flood can leave the "
+                           'board mute until it is reset')
+    view.add_argument('--log', metavar='FILE', default=None,
+                      help='also write every line the source produced to FILE, '
+                           'verbatim, so a run can be replayed ("--stdin < FILE") or '
+                           'measured offline (test/analyze_capture.py FILE)')
     args = p.parse_args(argv)
 
     if not args.sim and not args.port and not args.stdin:
@@ -2160,6 +2301,21 @@ def main(argv=None):
     else:
         source = SerialSource(args.port, state, args.range_v,
                               start_stream=not args.no_stream_command)
+
+    # --log: tee the source's raw text so the run outlives the page.  One writer
+    # (the source's own reader thread) and no buffering, so a capture is complete
+    # the moment it is stopped - including the lines this viewer could not parse.
+    log = None
+    if args.log:
+        try:
+            log = open(args.log, 'wb', buffering=0)
+        except OSError as exc:
+            print('live_plot: cannot write the capture %s: %s' % (args.log, exc),
+                  file=sys.stderr)
+        else:
+            source.parser.tee = log
+            print('live_plot: logging the raw lines to %s (replay with "--stdin < %s")'
+                  % (args.log, args.log))
 
     httpd = ThreadingHTTPServer((args.host, args.http_port), Handler)
     httpd.state         = state
@@ -2208,6 +2364,9 @@ def main(argv=None):
         httpd.stopping.set()
         httpd.shutdown()
         httpd.server_close()
+        if log is not None:
+            source.parser.tee = None        # the thread is joined: no more writers
+            log.close()
 
     print('live_plot: %d points in %d frames, %.1f s, %.0f points/s'
           % (state.points, state.frames, time.time() - state.t0, state.rate()))

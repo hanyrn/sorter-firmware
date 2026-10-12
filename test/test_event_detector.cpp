@@ -4,7 +4,7 @@
 // Build & run it with test/run_tests.ps1 (needs g++ or clang++).
 //
 // Scenarios:
-//   1. baseline 2000 +/- 5, three broad peaks (amplitude 800, sigma 200 samples),
+//   1. baseline 2000 +/- 10, three broad peaks (amplitude 1600, sigma 200 samples),
 //      a 1-sample glitch and a 4-sample glitch.  The three broad peaks are reported
 //      as VALID, and neither glitch becomes an event at all: the 1-sample one the
 //      impulse filter takes out, and the 4-sample one fails the RISE TEST (2 ms) and
@@ -43,7 +43,10 @@ double   gauss() {   // Box-Muller
 
 // The shipped configuration (see config.h): the behaviour below is judged against
 // the bounds the firmware actually runs with, at the rate it runs at (10 kSPS =>
-// one sample is 100 us, so 20 samples = 2 ms and 50 samples = 5 ms).
+// one sample is 100 us, so 20 samples = 2 ms and 50 samples = 5 ms).  The count
+// values are the shipped ones for the +/-5 V RANGE strap, and the waveform below
+// injects amplitudes in the same unit - so everything here is a factor-2 image of
+// the +/-10 V build (see the strap note above SIGNALGEN_ADC_PER_DAC in config.h).
 EventDetector::Config testConfig() {
     EventDetector::Config c;
     c.baseline_alpha    = 0.001f;
@@ -54,16 +57,16 @@ EventDetector::Config testConfig() {
     c.sigma_floor       = 1;
     c.quiet_samples     = 3000;    // DET_QUIET_SAMPLES     (0.3 s)
     c.quiet_seed_points = 128;     // DET_QUIET_SEED_POINTS
-    c.gate_max           = 160;    // DET_GATE_MAX
+    c.gate_max           = 320;    // DET_GATE_MAX
     c.end_debounce      = 2;       // DET_END_DEBOUNCE      (0.2 ms)
     c.min_rise_samples  = 20;      // DET_MIN_RISE_SAMPLES  (2 ms)
     c.dip_tolerance     = 3;       // DET_DIP_TOLERANCE     (0.3 ms)
     c.impulse_filter_taps = 7;     // DET_IMPULSE_FILTER_TAPS
-    c.min_max_value     = 80;      // DET_MIN_MAX_VALUE
+    c.min_max_value     = 160;     // DET_MIN_MAX_VALUE
     c.min_width_samples = 35;      // DET_MIN_WIDTH_SAMPLES (3.5 ms)
     c.max_width_samples = 20000;   // DET_MAX_WIDTH_SAMPLES (2 s, fault guard)
     c.min_area          = 0;       // DET_MIN_AREA
-    c.max_slope         = 100.0f;  // DET_MAX_SLOPE
+    c.max_slope         = 200.0f;  // DET_MAX_SLOPE
     return c;
 }
 
@@ -80,7 +83,7 @@ struct Wave {
 };
 
 int32_t signalAt(const Wave& w, int i) {
-    const double baseline = 2000.0, noise = 5.0;
+    const double baseline = 2000.0, noise = 10.0;
     double x = baseline + gauss() * noise;
     for (int p = 0; p < w.n_peaks; p++) {
         const double d = (double)(i - w.peaks[p].c);
@@ -115,8 +118,8 @@ static int g_failures = 0;
 // 1. peaks + a 1-sample and a 4-sample glitch
 // ---------------------------------------------------------------------------
 static void testPeaksAndGlitches() {
-    const Pulse  peaks[3]    = { {6000, 200, 800.0}, {13000, 200, 800.0}, {20000, 200, 800.0} };
-    const Glitch glitches[2] = { {9000, 1, 900.0}, {16000, 4, 900.0} };
+    const Pulse  peaks[3]    = { {6000, 200, 1600.0}, {13000, 200, 1600.0}, {20000, 200, 1600.0} };
+    const Glitch glitches[2] = { {9000, 1, 1800.0}, {16000, 4, 1800.0} };
     const Wave   wave        = { peaks, 3, glitches, 2, nullptr, 0, 0.0 };
 
     EventDetector det(testConfig());
@@ -136,7 +139,7 @@ static void testPeaksAndGlitches() {
                     (unsigned long long)m.area);
         if (m.valid) {
             valid++;
-            CHECK(m.max_value >= 650 && m.max_value <= 950,
+            CHECK(m.max_value >= 1300 && m.max_value <= 1900,
                   "peak amplitude out of range: %d", (int)m.max_value);
             CHECK(m.width_samples >= 600 && m.width_samples <= 1700,
                   "peak width out of range: %u", (unsigned)m.width_samples);
@@ -184,9 +187,9 @@ static void testPeaksAndGlitches() {
 // 2. impulses on and around a peak must not become its maximum
 // ---------------------------------------------------------------------------
 static void testImpulseDoesNotBecomeMax() {
-    const Pulse peaks[1] = { {6000, 200, 800.0} };
+    const Pulse peaks[1] = { {6000, 200, 1600.0} };
     const int   imp[3]   = { 5000, 6000, 6500 };   // before, on and after the apex
-    const Wave  wave     = { peaks, 1, nullptr, 0, imp, 3, 2000.0 };
+    const Wave  wave     = { peaks, 1, nullptr, 0, imp, 3, 4000.0 };
 
     EventDetector det(testConfig());
     PeakMetrics   m;
@@ -207,10 +210,10 @@ static void testImpulseDoesNotBecomeMax() {
 
     CHECK(closes == 1, "impulse: expected 1 event (the peak), got %d", closes);
     CHECK(valid == 1, "impulse: expected the peak to stay VALID");
-    // The peak is ~800 counts and the impulses are 2000: without the input filter, and
-    // without the slope-bounded measurement path, the reported maximum would be ~2800
+    // The peak is ~1600 counts and the impulses are 4000: without the input filter, and
+    // without the slope-bounded measurement path, the reported maximum would be ~5600
     // (baseline + peak + impulse).
-    CHECK(max_seen >= 700 && max_seen <= 950,
+    CHECK(max_seen >= 1400 && max_seen <= 1900,
           "impulse: reported max %d - the impulse leaked into the maximum", max_seen);
     // An impulse the median filter could not take out is suppressed, never reported as
     // an event of its own.
@@ -222,7 +225,7 @@ static void testImpulseDoesNotBecomeMax() {
 // ---------------------------------------------------------------------------
 // A 1 ms step (10 samples): the rise test throws it out silently.
 static void testShortStepSuppressed() {
-    const Glitch glitches[1] = { {6000, 10, 500.0} };
+    const Glitch glitches[1] = { {6000, 10, 1000.0} };
     const Wave   wave        = { nullptr, 0, glitches, 1, nullptr, 0, 0.0 };
 
     EventDetector det(testConfig());
@@ -240,7 +243,7 @@ static void testShortStepSuppressed() {
     CHECK(suppressed >= 1, "short step: the candidate should have been suppressed");
 }
 
-// A fast-attack excursion: 500 counts that arrive in 5 samples (1 ms) and then decay
+// A fast-attack excursion: 1000 counts that arrive in 5 samples (1 ms) and then decay
 // slowly, so the excursion lasts ~300 samples and *is* an event - but its apex is there
 // 5 samples after the crossing, which is not a rise, so it must be rejected by the
 // shape guard.  (The 1 ms step above never gets this far: the rise test suppresses it.)
@@ -250,10 +253,10 @@ static void testFastAttackRejected() {
     int closes = 0, valid = 0, reason = REASON_OK;
 
     for (int i = 0; i < 12000; i++) {
-        double x = 2000.0 + gauss() * 5.0;
+        double x = 2000.0 + gauss() * 10.0;
         if (i >= 6000) {
             const double t = (double)(i - 6000);
-            x += (t < 5.0) ? (100.0 * t) : (500.0 * std::exp(-(t - 5.0) / 80.0));
+            x += (t < 5.0) ? (200.0 * t) : (1000.0 * std::exp(-(t - 5.0) / 80.0));
         }
         const DetectorResult r = det.update((int32_t)std::lround(x), (uint32_t)i * 100u,
                                            (uint32_t)i, m);
@@ -283,9 +286,9 @@ static void testFastAttackRejected() {
 #define TRAP_RISE  40
 #define TRAP_HOLD  160
 #define TRAP_FALL  40
-#define TRAP_AMP   320.0
+#define TRAP_AMP   640.0
 static int32_t trapezoid(int i, int notch_at, int notch_len) {
-    double x = 2000.0 + gauss() * 5.0;
+    double x = 2000.0 + gauss() * 10.0;
     if (notch_len > 0 && i >= notch_at && i < notch_at + notch_len) {
         return (int32_t)std::lround(x);                     // the notch: back to baseline
     }
@@ -342,7 +345,7 @@ static void testQuietPeriodAndReference() {
     int closes = 0, valid = 0;
 
     for (int i = 0; i < 12000; i++) {
-        const int32_t x = (i >= 1000 && i < 1240) ? (int32_t)std::lround(2000.0 + 320.0 + gauss() * 5.0)
+        const int32_t x = (i >= 1000 && i < 1240) ? (int32_t)std::lround(2000.0 + 640.0 + gauss() * 10.0)
                                                   : trapezoid(i, 0, 0);
         const DetectorResult r = det.update(x, (uint32_t)i * 100u, (uint32_t)i, m);
         if (r != DET_CLOSED) { continue; }

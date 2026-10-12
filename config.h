@@ -244,6 +244,13 @@ static const uint8_t AD7606_BUSY1_PIN  = A5;
 // Every sample-counted knob below is tied to SORTER_SAMPLE_RATE_HZ: at 10 kSPS one
 // sample is 100 us, so 10 samples = 1 ms, 50 = 5 ms, 3000 = 0.3 s.  Change the rate
 // and all of them have to be re-expressed in samples.
+//
+// The other unit note: every *count* bound below is written for the RANGE strap this
+// build is made for - +/-5 V (RANGE tied to GND on both modules, 6553.6 counts/V, see
+// SIGNALGEN_ADC_PER_DAC at the bottom of this file).  The same physical bounds on a
+// +/-10 V build read half these numbers, which is why the generator's injected heights
+// are written at this strap too - the bench and the firmware have to agree on what a
+// count is worth, or a healthy peak comes back `rejected`.
 #define DET_BASELINE_ALPHA     0.001f
 #define DET_NOISE_ALPHA        0.001f
 #define DET_K_ON               5.0f
@@ -264,8 +271,8 @@ static const uint8_t AD7606_BUSY1_PIN  = A5;
 // bench generator has been drawing pulses since its own sample 0 (signal_gen.cpp does
 // not hold the DACs for the quiet period), so the board's first quiet period is mostly
 // pulse.  The median then locks onto the pulse: measured with
-// `test/test_bench_detect.exe --peaks --start live`, the reference seeds to base 5658
-// with sigma 353 counts, i.e. a +1764-count trigger instead of the +52..59 a
+// `test/test_bench_detect.exe --peaks --start live`, the reference seeds to base 11316
+// with sigma 706 counts, i.e. a +3528-count trigger instead of the +104..118 a
 // noise-seeded run arms with - so the first pattern cycles lose real peaks (3 of the 90
 // peak spans of an 8-cycle run are never reported, and those that do come back measure
 // ~113 samples narrower than the span that was drawn), until the gated EMA walks the
@@ -279,12 +286,12 @@ static const uint8_t AD7606_BUSY1_PIN  = A5;
 // a window is open the *noise* estimate stops being refreshed at all: the gate is wider
 // than the band a peak opens on (k_gate > k_off), so a faint peak's own flank is inside
 // it and would otherwise feed its rise into sigma, lifting the trigger with it (measured:
-// sigma 13.5 -> 19.2 counts across one 60-count rung at 600 samples, i.e. the trigger
-// from +68 to +96, above that rung's own apex).  The mean keeps tracking - it is what
+// sigma 27.0 -> 38.4 counts across one 120-count rung at 600 samples, i.e. the trigger
+// from +136 to +192, above that rung's own apex).  The mean keeps tracking - it is what
 // follows the slow wander - while sigma is held (see EventDetector::updateBaseline).
 #define DET_QUIET_SAMPLES      3000
 #define DET_QUIET_SEED_POINTS  128
-#define DET_GATE_MAX           160
+#define DET_GATE_MAX           320
 // End of an event: this many consecutive samples back below the baseline band.
 // 2 samples = 0.2 ms at 10 kSPS.
 #define DET_END_DEBOUNCE       2
@@ -388,15 +395,15 @@ static const uint8_t AD7606_BUSY1_PIN  = A5;
 // all three can still be rejected on its *measured* leading edge, because a faint pulse
 // reaches the noise band high up its flank and the edge the detector measures is then
 // short even when the event is long (that is the DET_MIN_RISE_SAMPLES note, and the
-// bench's shape clause says the same).  The bench's 4.6 ms / 1072-count needle is exactly
+// bench's shape clause says the same).  The bench's 4.6 ms / 2144-count needle is exactly
 // that case: drawn 46 samples wide - over this floor by a wide margin, and its window
 // comes back 44 - and still reported as `rejected SHORT_FOR_HEIGHT`, because its apex
-// arrives 15 samples (1.5 ms) after the window opened, and a 1072-count rise in 1.5 ms is
+// arrives 15 samples (1.5 ms) after the window opened, and a 2144-count rise in 1.5 ms is
 // a step's edge, not a pulse's.
 // DET_MAX_WIDTH_SAMPLES is NOT a filter but a fault guard: a signal that never comes
 // back to the baseline (a stuck channel) is closed there so detection cannot hang.
 // 20000 samples = 2 s, 4x the longest event expected.
-#define DET_MIN_MAX_VALUE      80
+#define DET_MIN_MAX_VALUE      160
 #define DET_MIN_WIDTH_SAMPLES  35u
 #define DET_MAX_WIDTH_SAMPLES  20000u
 #define DET_MIN_AREA           0ull
@@ -426,36 +433,36 @@ static const uint8_t AD7606_BUSY1_PIN  = A5;
 #define DET_MIN_RISE_SAMPLES   20u
 #define DET_DIP_TOLERANCE      3u
 // ... and no value is measured - and no descent is read as "back at the baseline" -
-// if the signal moved faster than this.  100 counts/sample = 1e6 counts/s at 10 kSPS:
-// 5x the fastest edge a real event can have (500 counts in 5 ms), and far below what
-// one impulse does (~750 counts in a single sample).  Set it too low and a real apex
+// if the signal moved faster than this.  200 counts/sample = 2e6 counts/s at 10 kSPS:
+// 5x the fastest edge a real event can have (1000 counts in 5 ms), and far below what
+// one impulse does (~1500 counts in a single sample).  Set it too low and a real apex
 // gets clipped (clippedSamples() counts those samples); too high and a spike is
 // tracked again.
 //
 // This bound is a statement about the *physics* of the application (how fast the
 // signal is allowed to move), so it is the one a narrow event hits first and hardest:
-// a 3 ms needle that rises 3000 counts reaches its apex 15 samples after its
-// crossing, i.e. 200 counts/sample - twice this - and comes back
+// a 3 ms needle that rises 6000 counts reaches its apex 15 samples after its
+// crossing, i.e. 400 counts/sample - twice this - and comes back
 // `rejected SHORT_FOR_HEIGHT` however healthy the peak is.  The bench waveform draws
 // those needles on purpose now (`SIGNALGEN_WIDTH_MIN` 3.0 ms), and the measurement
-// backs the arithmetic: the tallest needle in a 6-cycle run is *drawn* 3293 counts
+// backs the arithmetic: the tallest needle in a 6-cycle run is *drawn* 6586 counts
 // over 46 samples (4.6 ms) and the detector still rejects it - the 7-tap median blunts
-// the apex to max 2746 counts and the crossing-to-apex edge is ~15 samples (the raw
-// dump for that span is what `--peaks` prints), i.e. 183 counts/sample, nearly twice
+// the apex to max 5492 counts and the crossing-to-apex edge is ~15 samples (the raw
+// dump for that span is what `--peaks` prints), i.e. 366 counts/sample, nearly twice
 // this bound.  It is the height/edge test that fires, not the width floor: the same
 // needle's width - the pulse's own duration now, see the note above - is over the
 // 35-sample floor, so what stops it is this bound.  The audit finds it outside the
 // documented envelope (the *drawn* edge is what DET_MAX_SLOPE is written against), not as
 // a lost peak.  Read against the waveform, the bound is a cap on the amplitude a given
-// width may carry: a raised cosine's steepest edge is pi * A / W, so A <= 100 * W / pi,
-// i.e. ~32 counts per sample of width - a 3.5 ms (35-sample) event is acceptable up to
-// ~1100 counts, and the 4.6 ms / 3293-count needle above is 2.3x over it.  Whether that
+// width may carry: a raised cosine's steepest edge is pi * A / W, so A <= 200 * W / pi,
+// i.e. ~64 counts per sample of width - a 3.5 ms (35-sample) event is acceptable up to
+// ~2200 counts, and the 4.6 ms / 6586-count needle above is 2.3x over it.  Whether that
 // is the right physics for the application is a question for the application, not for
 // this bound: raising it (or drawing the generator's needles to it) is the knob.  Raising
 // it is what "we must catch a 3 ms event" ultimately asks for - and the headroom is the
 // impulse, not the peak: the input median filter has already removed the spikes by then,
-// and what is left to reject is a step at ~750 counts in ONE sample.
-#define DET_MAX_SLOPE          100.0f
+// and what is left to reject is a step at ~1500 counts in ONE sample.
+#define DET_MAX_SLOPE          200.0f
 
 // Saturation ("rail") guard.  A bright source drives an AD7606 input past its
 // range, where the reading clips at full scale: nothing can be measured there, so
@@ -463,7 +470,8 @@ static const uint8_t AD7606_BUSY1_PIN  = A5;
 // is declared railed after DET_RAIL_WIDTH consecutive samples at or beyond
 // +/-DET_RAIL_LEVEL counts, then held out for DET_RAIL_COOLDOWN samples.  The M7
 // is told once per rail episode (SIGNAL TOO BRIGHT) so the operator can act.
-#define DET_RAIL_LEVEL         32000   // |sample| >= this = saturated (counts, +/-10 V)
+#define DET_RAIL_LEVEL         32000   // |sample| >= this = saturated: 4.88 V of the
+                                       // ADC's 5 V full scale (9.77 V at +/-10 V)
 #define DET_RAIL_WIDTH         8       // consecutive saturated samples to declare a rail
 #define DET_RAIL_COOLDOWN      1000    // samples a railed channel is held out of detection
 
@@ -557,7 +565,7 @@ static const uint8_t AD7606_BUSY1_PIN  = A5;
 #define SIGNALGEN_NOISE_ALPHA    1.0f    // dither low-pass weight (1.0 = white)
 #define SIGNALGEN_BASELINE_WAVE_CODE    150      // slow wander of that DC level:
                                                  // +/- this many DAC codes
-                                                 // (~+/-396 AD counts at +/-10 V:
+                                                 // (~+/-792 AD counts at +/-5 V:
                                                  // 9x the dither, 3x the K_ON
                                                  // trigger - and still not a peak)
 #define SIGNALGEN_BASELINE_WAVE_SAMPLES 300000u  // ... one full sine over this many
@@ -594,13 +602,13 @@ static const uint8_t AD7606_BUSY1_PIN  = A5;
 #define SIGNALGEN_WIDTH_SPAN_PCT   40u     // % of the peaks drawn log-uniform over
                                            // [WIDTH_MIN, WIDTH_MEAN] instead of the
                                            // Gaussian - the needles, in every cycle
-#define SIGNALGEN_HEIGHT_MEAN      900.0f  // nominal peak height (AD7606 counts)
-#define SIGNALGEN_HEIGHT_SD        300.0f
+#define SIGNALGEN_HEIGHT_MEAN      1800.0f  // nominal peak height (AD7606 counts)
+#define SIGNALGEN_HEIGHT_SD        600.0f
 #define SIGNALGEN_HEIGHT_SPAN_PCT  30u     // % of peaks drawn log-uniform, over the
                                            // whole MIN..MAX span, instead
-#define SIGNALGEN_HEIGHT_MIN       160     // counts: ~1.3 * K_ON * sigma, i.e. an apex
+#define SIGNALGEN_HEIGHT_MIN       320     // counts: ~1.3 * K_ON * sigma, i.e. an apex
                                            // that only just clears the noise band
-#define SIGNALGEN_HEIGHT_MAX       20000   // counts: past the DAC clamp, so the top of
+#define SIGNALGEN_HEIGHT_MAX       40000   // counts: past the DAC clamp, so the top of
                                            // the span saturates the source
 // ---- the small-peak slice: the corner the bounds decide -------------------
 // The height draw above reaches down to HEIGHT_MIN, but it is drawn *independently
@@ -616,39 +624,39 @@ static const uint8_t AD7606_BUSY1_PIN  = A5;
 //
 //     apex_min(w) = FRONTIER_TRIGGER / cos^2(FRONTIER_RISE * pi / w)
 //
-// which over the band the slice uses (200..800 samples) is 100..133 counts, so the
-// slice puts ~250..550-count peaks - the *small* end of the train - into most cycles,
+// which over the band the slice uses (200..800 samples) is 200..266 counts, so the
+// slice puts ~500..1100-count peaks - the *small* end of the train - into most cycles,
 // and the run fails on any of them that comes back `rejected` (the bench's own MISSED /
 // envelope checks).  It applies over the FRONTIER_WIDTH_MIN..MAX band only, which is
 // the range over which the *documented* envelope is the whole story: narrower, the
 // slope guard (DET_MAX_SLOPE) owns the corner and the same apex needs a far taller
 // pulse; wider, it is the run's own *reference* that sets the floor: the trigger is
 // base + k_on * sigma, so the run's sigma decides - together with DET_MIN_MAX_VALUE,
-// since the excursion has to *reach* 80 counts to be reported at all, and at this noise
-// level a drawn apex has to be about 60-70 counts for its reported max to get there.
-// Measured with --ladder, 4 cycles, shipped front end: 1545 samples takes 70 counts and
-// up (sigma 11.9 -> on +59) and leaves 30 and 50 "never crossed the on-threshold", while
-// the same width asked for as four rungs 212..272 (sigma 10.4 -> on +52) is VALID at
+// since the excursion has to *reach* 160 counts to be reported at all, and at this noise
+// level a drawn apex has to be about 120-140 counts for its reported max to get there.
+// Measured with --ladder, 4 cycles, shipped front end: 1545 samples takes 140 counts and
+// up (sigma 23.8 -> on +118) and leaves 60 and 100 "never crossed the on-threshold", while
+// the same width asked for as four rungs 424..544 (sigma 20.8 -> on +104) is VALID at
 // every one - window 1180..1228 samples, duration 1413..1493 of the 1545 drawn.
-// At 907 samples it is the same story: four rungs 335..395 all VALID (windows 730..786,
-// durations 850..912), and the 30..160 walk-up puts the floor between 60 and 70 counts.
+// At 907 samples it is the same story: four rungs 670..790 all VALID (windows 730..786,
+// durations 850..912), and the 60..320 walk-up puts the floor between 120 and 140 counts.
 // What a faint rung must not do is decide that sigma for itself: an excursion may not
 // feed the noise estimate - EventDetector::updateBaseline() freezes it while a window is
 // open - because a rung whose own flank is inside the reference gate otherwise lifts its
-// trigger as it rises.  Measured at 600 samples: sigma walked 13.5 -> 19.2 counts across
-// one 60-count rung, i.e. the trigger from +68 to +96 counts, above that rung's own apex,
+// trigger as it rises.  Measured at 600 samples: sigma walked 27.0 -> 38.4 counts across
+// one 120-count rung, i.e. the trigger from +136 to +192 counts, above that rung's own apex,
 // so it was never crossed.  Those regimes are
 // real and worth knowing (see the notes under DET_MIN_RISE_SAMPLES / DET_END_DEBOUNCE
 // above); the slice stays inside the band so that the run is about the detector's
 // floor and not about the corner cases around it.
 //
-// Measured against a swept single pulse on the bench's own detector stack (+/-10 V,
+// Measured against a swept single pulse on the bench's own detector stack (+/-5 V,
 // front end 3, the dither and the slow wander - walked with `--ladder`, 4 cycles: sigma
-// 10.4..11.9 counts after the quiet period, so the trigger the run judges with is
-// +52..59), the smallest *drawn* apex that comes back VALID is
+// 20.8..23.8 counts after the quiet period, so the trigger the run judges with is
+// +104..118), the smallest *drawn* apex that comes back VALID is
 //
 //     width (samples)   30-50   60    80   100   150-1200  2400
-//     smallest VALID     never   140   100   60     70-100    80
+//     smallest VALID     never   280   200   120   140-200   160
 //     apex (counts)      (3-5 ms: no edge long enough at any height - the rise test)
 //     what sets it       rise   rise+slope  slope  bound  bound/tracker  tracker
 //
@@ -662,10 +670,10 @@ static const uint8_t AD7606_BUSY1_PIN  = A5;
 // prints both numbers for every span, so any of these can be re-measured directly - and
 // `test_bench_detect --ladder` (or `live_plot.py --sim --ladder`) walks one column of
 // that table as a *visible* staircase: see SIGNALGEN_LADDER_* below.
-// (FRONTIER_TRIGGER is the round 100 rather than the 52..59 that was measured: the
+// (FRONTIER_TRIGGER is the round 200 rather than the 104..118 that was measured: the
 // envelope is apex_min(w) = TRIGGER / cos^2(...), so this is the *apex* the slice has
-// to clear, not the threshold it is compared against - 100 keeps the slice's peaks
-// (250..550 counts) at the bottom of the train, about twice the trigger the run
+// to clear, not the threshold it is compared against - 200 keeps the slice's peaks
+// (500..1100 counts) at the bottom of the train, about twice the trigger the run
 // judges with, and above DET_MIN_MAX_VALUE so that they can be reported at all.)
 // The 2400-sample column is the other end of the story: a pulse that
 // slow spends longer than the baseline tracker's own time constant
@@ -688,14 +696,14 @@ static const uint8_t AD7606_BUSY1_PIN  = A5;
                                               // reference sets the floor - it is
                                               // k_on * sigma, plus DET_MIN_MAX_VALUE
                                               // on the reported max (measured: 1545
-                                              // samples takes 70 counts and up,
-                                              // 30 and 50 come back "never crossed
+                                              // samples takes 140 counts and up,
+                                              // 60 and 100 come back "never crossed
                                               // the on-threshold") - the slice stays
                                               // inside what the documented envelope
                                               // covers
-#define SIGNALGEN_FRONTIER_TRIGGER    100     // counts: the on-threshold the apex is
-                                              // judged against (measured +52..59 on
-                                              // the filtered stream, +122 on the raw)
+#define SIGNALGEN_FRONTIER_TRIGGER    200     // counts: the on-threshold the apex is
+                                              // judged against (measured +104..118 on
+                                              // the filtered stream, +244 on the raw)
 #define SIGNALGEN_FRONTIER_RISE       20u     // DET_MIN_RISE_SAMPLES: samples of
                                               // leading edge the apex has to show
 #define SIGNALGEN_FRONTIER_MARGIN_MIN 2.5f    // apex = apex_min(width) x this..that
@@ -703,12 +711,12 @@ static const uint8_t AD7606_BUSY1_PIN  = A5;
 // ---- the floor ladder: *seeing* how close to the baseline a peak can be -----
 // The table above is a measurement, and the random train cannot show it.  Its gaps are
 // 30..900 samples (3..90 ms) against 120 ms-wide pulses and 80 % of its pulses fuse
-// with a neighbour, so a small apex is normally a *shoulder* on a 900-count slope, and
+// with a neighbour, so a small apex is normally a *shoulder* on a 1800-count slope, and
 // on a plot whose vertical scale is set by the train itself (it reaches the DAC clamp:
-// ~10166 counts at +/-10 V) a 300-count apex is two or three pixels - less than the
-// +/-1056-count impulse spikes sharing the trace.  Measured over 8 cycles: 19 spans
-// carry a pulse <= 500 counts, and 42..1400 samples separate them from neighbours that
-// are 500..3165 counts tall.  So "how close to the baseline can an apex be and still
+// ~20328 counts at +/-5 V) a 600-count apex is two or three pixels - less than the
+// +/-2112-count impulse spikes sharing the trace.  Measured over 8 cycles: 19 spans
+// carry a pulse <= 1000 counts, and 42..1400 samples separate them from neighbours that
+// are 1000..6330 counts tall.  So "how close to the baseline can an apex be and still
 // be detected" cannot be *seen* on the live plot at all.
 //
 // SIGNALGEN_LADDER = 1 answers it.  The pattern becomes a staircase: LADDER_COUNT
@@ -718,12 +726,12 @@ static const uint8_t AD7606_BUSY1_PIN  = A5;
 // SIGNALGEN_LADDER_STEP from SIGNALGEN_LADDER_MIN.  Nothing else is drawn - no random
 // pulses, no glitches, and no impulses - so:
 //
-//   * the dither (+/-16 DAC codes = +/-42 counts) and the slow wander are all the
-//     detector has to separate a rung from, and its on-threshold (+52..59 counts
+//   * the dither (+/-16 DAC codes = +/-84 counts) and the slow wander are all the
+//     detector has to separate a rung from, and its on-threshold (+104..118 counts
 //     measured, see the table above) sits in the *middle* of the ladder, which is what
 //     makes the rungs below it the interesting ones;
 //   * the live plot's own auto scale settles near the ladder instead of on the tallest
-//     false peak, so the bottom rungs are a few pixels of the 84-count noise band and
+//     false peak, so the bottom rungs are a few pixels of the 168-count noise band and
 //     the top ones fill a third of the pane - and the firmware's own event lines say
 //     which rungs it took.  The lowest rung it accepts *is* the floor at that width.
 //
@@ -738,66 +746,66 @@ static const uint8_t AD7606_BUSY1_PIN  = A5;
 // too (see the table above), and the ladder fixes only the width it draws - walk the
 // other dimension with `--ladder-width 200 / 600 / 1200`.
 //
-// Measured with it (12 rungs 20..460 counts at 600 samples, 4 cycles per run): the first
-// rung the detector takes is 60 counts - a borderline apex whose reported max (84) only
+// Measured with it (12 rungs 40..920 counts at 600 samples, 4 cycles per run): the first
+// rung the detector takes is 120 counts - a borderline apex whose reported max (168) only
 // just reaches DET_MIN_MAX_VALUE, so it comes and goes with the dither on it, which is
 // the honest answer at this width rather than a single number.  The *same* 60 ms rung
-// placement, refined with --ladder-step 10 from 20, puts the edge between 60 and 70
-// counts (60 silent).  So "the floor at 60 ms" is a *band* of 60-70 counts and the spread
+// placement, refined with --ladder-step 20 from 40, puts the edge between 120 and 140
+// counts (120 silent).  So "the floor at 60 ms" is a *band* of 120-140 counts and the spread
 // is a borderline apex being decided by the dither on it - the same reason the table above
 // is a staircase and not a curve.  The table's own figure for that column (70-100) sits
 // just above the band.
 //
 // That bottom rung is not decided by the *trigger*, which is worth knowing before
-// lowering DET_K_ON to "reach" it: re-measured with DET_K_ON = 4 (on +41 instead of the
-// +52 above), the 12-rung ladder answers *identically* - the same rungs, the same
-// windows, the same reported maxes, the same 3 of 6 seeds taking the 60-count rung, and
+// lowering DET_K_ON to "reach" it: re-measured with DET_K_ON = 4 (on +82 instead of the
+// +104 above), the 12-rung ladder answers *identically* - the same rungs, the same
+// windows, the same reported maxes, the same 3 of 6 seeds taking the 120-count rung, and
 // the bench's false accepts still 0 - because the trace does cross the lower trigger
 // either way.  What decides it is how much of the drawn apex is left once the run's own
 // reference is subtracted (the tracker partly follows a 600-sample rung), which is why
 // the edge moves with the seed and not with the trigger.
 //
-// Walking the width with the shipped staircase (--ladder-width, 12 rungs 20..460, step 40)
+// Walking the width with the shipped staircase (--ladder-width, 12 rungs 40..920, step 80)
 // brackets the table above from the step side: 40 samples (4 ms) takes *nothing* - 10 of
 // the 12 rungs rejected, and the run says "no claim on the pinnacle" instead of failing,
-// because no apex can show a 20-sample edge there; 60 (6 ms) between 180 and 220 counts;
-// 80 (8 ms) between 100 and 140; 100..200 (10..20 ms) between 60 and 100; 300..1200
-// (30..120 ms) between 20 and 60, i.e. rung #2 (60 counts) taken.  A width the ladder
+// because no apex can show a 20-sample edge there; 60 (6 ms) between 360 and 440 counts;
+// 80 (8 ms) between 200 and 280; 100..200 (10..20 ms) between 120 and 200; 300..1200
+// (30..120 ms) between 40 and 120, i.e. rung #2 (120 counts) taken.  A width the ladder
 // cannot draw at all (2400 samples into a 1666-sample slot) fails with that reason rather
 // than reporting a floor it did not measure.
 //
-// The ladder answers in --ladder-step jumps (40 counts) and its bottom rung flips a step
+// The ladder answers in --ladder-step jumps (80 counts) and its bottom rung flips a step
 // with the slot geometry, so read the *band* and not the number: the same 600-sample rung
 // is taken at the shipped 12 rungs per cycle and left alone at --ladder-count 6.  A slot
 // long against the baseline tracker's time constant (1/DET_BASELINE_ALPHA = 1000 samples)
 // is what a *wide* rung needs, not a lower floor: at 12 rungs/cycle a 1200-sample rung
-// leaves 466 samples of baseline and still reads between 20 and 60 counts (11 of 12
+// leaves 466 samples of baseline and still reads between 40 and 120 counts (11 of 12
 // VALID), while a 2400-sample rung cannot be drawn there at all and draws at
-// --ladder-count 4 (5000-sample slots), reading between 60 and 100 - the table's own
+// --ladder-count 4 (5000-sample slots), reading between 120 and 200 - the table's own
 // 240 ms cell.  So --ladder-count buys a wide rung the room to be drawn, and the table
 // stays the finer measurement of the floor (one raised cosine, fresh quiet period).
 #define SIGNALGEN_LADDER       0       // 0 = the random train, 1 = the floor ladder
 #define SIGNALGEN_LADDER_WIDTH 600u    // samples (60 ms): the width every rung has,
                                        // inside the band the table above covers
-#define SIGNALGEN_LADDER_MIN   20      // counts: the bottom rung's apex - well inside
-                                       // the +/-42-count dither band, so the staircase
+#define SIGNALGEN_LADDER_MIN   40      // counts: the bottom rung's apex - well inside
+                                       // the +/-84-count dither band, so the staircase
                                        // starts where a peak cannot be told from noise
-#define SIGNALGEN_LADDER_STEP  40      // counts between neighbouring rungs
-#define SIGNALGEN_LADDER_COUNT 12u     // rungs: 20, 60, ... 460 counts.  12 x (1666-smp
+#define SIGNALGEN_LADDER_STEP  80      // counts between neighbouring rungs
+#define SIGNALGEN_LADDER_COUNT 12u     // rungs: 40, 120, ... 920 counts.  12 x (1666-smp
                                        // slot) = one cycle, and every rung fits with
                                        // (slot - width) = 1066 samples of baseline
                                        // around it
 #define SIGNALGEN_GLITCH_PCT       40u     // % of pulses that are glitches
 #define SIGNALGEN_GLITCH_WIDTH_MAX 6u      // glitch width uniform in 1..this
-#define SIGNALGEN_GLITCH_HEIGHT_MEAN 1800.0f
-#define SIGNALGEN_GLITCH_HEIGHT_SD   1100.0f
-#define SIGNALGEN_GLITCH_HEIGHT_MIN  120
-#define SIGNALGEN_GLITCH_HEIGHT_MAX  20000
+#define SIGNALGEN_GLITCH_HEIGHT_MEAN 3600.0f
+#define SIGNALGEN_GLITCH_HEIGHT_SD   2200.0f
+#define SIGNALGEN_GLITCH_HEIGHT_MIN  240
+#define SIGNALGEN_GLITCH_HEIGHT_MAX  40000
 
 // The DAC output buffer is only linear from roughly 0.2 V to VDDA-0.2 V, so keep
 // the generated code inside this window (250 .. 3850 of 0 .. 4095).  This is also
 // where a saturated peak flattens out: the tallest a pulse can ever measure is
-// (MAX_CODE - BASELINE_CODE) * ADC_PER_DAC ~= 4757 counts at +/-10 V, whatever
+// (MAX_CODE - BASELINE_CODE) * ADC_PER_DAC ~= 9515 counts at +/-5 V, whatever
 // SIGNALGEN_HEIGHT_MAX asks for - the rest of the excursion is clipped away.
 #define SIGNALGEN_MIN_CODE       250
 #define SIGNALGEN_MAX_CODE       3850
@@ -808,11 +816,22 @@ static const uint8_t AD7606_BUSY1_PIN  = A5;
 //   AD7606 +/-10 V : 32768 counts / 10 V = 3276.8 counts/V  -> 2.64 counts/count
 //   AD7606 +/-5 V  : 32768 counts /  5 V = 6553.6 counts/V  -> 5.28 counts/count
 // A unipolar sensor (0..3.3 V / 0..5 V) also uses the +/-5 V setting: the code
-// simply stays in the positive half (0..+32767 for 0..5 V).  The ABSOLUTE
-// detector bounds (DET_MIN_MAX_VALUE, DET_MIN_AREA, DET_MAX_SLOPE) scale by the
-// same factor when the range changes; the ones measured in samples or relative to
-// sigma (DET_MIN_WIDTH_SAMPLES, DET_MIN_RISE_SAMPLES, K_ON/K_OFF) do not.
-#define SIGNALGEN_ADC_PER_DAC    2.64f
+// simply stays in the positive half (0..+32767 for 0..5 V).
+//
+// THIS BUILD IS THE +/-5 V STRAP (RANGE tied to GND on both modules): it is what a
+// 0..5 V sensor wants, and it doubles the counts per volt.  The strap is a package
+// deal - the count bounds and injected heights around it are written for it, and
+// every tool that reads the bench has to be told the same thing (live_plot.py /
+// plot_signals.py / analyze_capture.py --range 5).  The ABSOLUTE count constants
+// are written at this strap and scale by the same factor when the range changes:
+// this one, DET_MIN_MAX_VALUE (160), DET_MIN_AREA, DET_MAX_SLOPE (200
+// counts/sample), DET_GATE_MAX (320) and the SIGNALGEN heights and ladder rungs
+// above (they are counts above the baseline, so they move with the strap too).
+// The ones measured in samples or relative to sigma (DET_MIN_WIDTH_SAMPLES,
+// DET_MIN_RISE_SAMPLES, DET_K_ON/DET_K_OFF/DET_K_GATE, DET_SIGMA_FLOOR) do not -
+// which is what lands the same *physical* pulse and the same bound on the same
+// volts on either strap.
+#define SIGNALGEN_ADC_PER_DAC    5.28f
 
 // Busy-wait helper used for sub-microsecond AD7606 timing margins.
 static inline void tinyDelayNs(uint32_t ns) {

@@ -80,6 +80,33 @@ static void waitNextSample(uint32_t& next_us) {
 #endif
 }
 
+// The sample clock, in *microseconds on the sample grid* rather than on the wall
+// clock.  Nothing in the detection path is timed in microseconds - every bound in
+// config.h counts samples - but the reported window is, and test/live_plot.py maps
+// a window back onto the sample indices the `S,` lines carry with
+//
+//     us_to_sample(us) = us * SORTER_SAMPLE_RATE_HZ / 1e6        (live_plot.py)
+//
+// That identity only holds if the stamps start at 0 with sample 0, which micros()
+// does not: the acquisition thread starts after Serial.begin()/RPC.begin() - and,
+// in bench mode, after begin()/reset() - so its first sample already carries
+// milliseconds of uptime and every drawn window landed that far to the *right* of
+// the peak it described (a constant shift, and only on the board: the bench harness
+// has always stamped the loop index, `agg.update(channels, i * kDtUs, i, ...)` in
+// test/test_bench_detect.cpp, which is why --sim places its overlays exactly).
+// Stamping index * period_us makes the board agree with the harness and with the
+// sample stream.  With the loop free-running (SORTER_SAMPLE_RATE_HZ = 0) there is no
+// grid to stamp, so the wall clock stays the only time base.
+static inline uint32_t sampleStampUs(uint32_t index, uint32_t wall_us) {
+#if SORTER_SAMPLE_RATE_HZ > 0
+    (void)wall_us;
+    return (uint32_t)(((uint64_t)index * 1000000u) / SORTER_SAMPLE_RATE_HZ);
+#else
+    (void)index;
+    return wall_us;
+#endif
+}
+
 static EventDetector::Config makeDetectorConfig() {
     EventDetector::Config c;
     c.baseline_alpha    = DET_BASELINE_ALPHA;
@@ -187,7 +214,7 @@ static void acquisitionTask() {
 
         // Every channel is measured on its own; a completed event carries one
         // record per active channel and is handed to the M7 in a single frame.
-        if (g_aggregator.update(channels, micros(), index, g_event)) {
+        if (g_aggregator.update(channels, sampleStampUs(index, micros()), index, g_event)) {
             sorter::sendBundle(g_event.bundle, g_event.ch);
         }
         index++;

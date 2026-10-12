@@ -54,18 +54,18 @@ DEFAULTS = dict(
     width_span_pct=40,          # SIGNALGEN_WIDTH_SPAN_PCT   % of peaks drawn
                                 #                            log-uniform over
                                 #                            [width_min, width_mean]
-    height_mean=900.0,          # SIGNALGEN_HEIGHT_MEAN       nominal peak (counts)
-    height_sd=300.0,            # SIGNALGEN_HEIGHT_SD
+    height_mean=1800.0,         # SIGNALGEN_HEIGHT_MEAN       nominal peak (counts)
+    height_sd=600.0,            # SIGNALGEN_HEIGHT_SD
     height_span_pct=30,         # SIGNALGEN_HEIGHT_SPAN_PCT   % of peaks drawn
                                 #                             log-uniform instead
-    height_min=160,             # SIGNALGEN_HEIGHT_MIN        counts (~1.3*5 sigma)
-    height_max=20000,           # SIGNALGEN_HEIGHT_MAX        counts (past the clamp)
+    height_min=320,             # SIGNALGEN_HEIGHT_MIN        counts (~1.3*5 sigma)
+    height_max=40000,           # SIGNALGEN_HEIGHT_MAX        counts (past the clamp)
     frontier_pct=50,            # SIGNALGEN_FRONTIER_PCT      % of peaks that take
                                 #                             the small-peak style in
                                 #                             the band below
     frontier_width_min=200,     # SIGNALGEN_FRONTIER_WIDTH_MIN  the band the slice
     frontier_width_max=800,     # SIGNALGEN_FRONTIER_WIDTH_MAX  applies in: 20..80 ms
-    frontier_trigger=100,       # SIGNALGEN_FRONTIER_TRIGGER  counts (k_on * sigma)
+    frontier_trigger=200,       # SIGNALGEN_FRONTIER_TRIGGER  counts (k_on * sigma)
     frontier_rise=20,           # SIGNALGEN_FRONTIER_RISE     DET_MIN_RISE_SAMPLES
     frontier_margin_min=2.5,    # SIGNALGEN_FRONTIER_MARGIN_MIN  apex = floor(width)
     frontier_margin_max=5.0,    # SIGNALGEN_FRONTIER_MARGIN_MAX  x this..that
@@ -76,16 +76,16 @@ DEFAULTS = dict(
                                 #   defaultsMatchConfig - keep all three in step)
                                 #                          instead of the random train
     ladder_width=600,           # SIGNALGEN_LADDER_WIDTH   samples (60 ms): every rung
-    ladder_min=20,              # SIGNALGEN_LADDER_MIN     counts: bottom rung's apex,
-                                #                          inside the +/-42-count dither
-    ladder_step=40,             # SIGNALGEN_LADDER_STEP    counts between rungs
-    ladder_count=12,            # SIGNALGEN_LADDER_COUNT   rungs: 20, 60 ... 460 counts
+    ladder_min=40,              # SIGNALGEN_LADDER_MIN     counts: bottom rung's apex,
+                                #                          inside the +/-84-count dither
+    ladder_step=80,             # SIGNALGEN_LADDER_STEP    counts between rungs
+    ladder_count=12,            # SIGNALGEN_LADDER_COUNT   rungs: 40, 120 ... 920 counts
     glitch_pct=40,              # SIGNALGEN_GLITCH_PCT
     glitch_width_max=6,         # SIGNALGEN_GLITCH_WIDTH_MAX
-    glitch_height_mean=1800.0,  # SIGNALGEN_GLITCH_HEIGHT_MEAN
-    glitch_height_sd=1100.0,    # SIGNALGEN_GLITCH_HEIGHT_SD
-    glitch_height_min=120,      # SIGNALGEN_GLITCH_HEIGHT_MIN
-    glitch_height_max=20000,    # SIGNALGEN_GLITCH_HEIGHT_MAX
+    glitch_height_mean=3600.0,  # SIGNALGEN_GLITCH_HEIGHT_MEAN
+    glitch_height_sd=2200.0,    # SIGNALGEN_GLITCH_HEIGHT_SD
+    glitch_height_min=240,      # SIGNALGEN_GLITCH_HEIGHT_MIN
+    glitch_height_max=40000,    # SIGNALGEN_GLITCH_HEIGHT_MAX
     baseline_code=2048,         # SIGNALGEN_BASELINE_CODE  (~1.65 V)
     noise_code=16,              # SIGNALGEN_NOISE_CODE     (~13 mV)
     noise_alpha=1.0,            # SIGNALGEN_NOISE_ALPHA    (1.0 = white)
@@ -96,7 +96,7 @@ DEFAULTS = dict(
     spike_max=400,              # SIGNALGEN_SPIKE_MAX      (DAC codes, uniform +/-)
     min_code=250,               # SIGNALGEN_MIN_CODE
     max_code=3850,              # SIGNALGEN_MAX_CODE
-    adc_per_dac=2.64,           # SIGNALGEN_ADC_PER_DAC    (counts per DAC code)
+    adc_per_dac=5.28,           # SIGNALGEN_ADC_PER_DAC    (counts per DAC code)
     seed=0x2F6E2B1,             # SIGNALGEN_SEED
 )
 
@@ -869,12 +869,12 @@ def self_check(cycles=120, verbose=True):
                       if p['kind'] == RAISED_COSINE]
     n_median = _median(nominal_h)
     check('peak height median ~ %.0f (the nominal draws alone)' % cfg['height_mean'],
-          abs(n_median - cfg['height_mean']) < 120.0,
+          abs(n_median - cfg['height_mean']) < 240.0,
           '%.0f over %d peaks' % (n_median, len(nominal_h)))
-    small_pct = 100.0 * len([h for h in peak_h if h < 500]) / float(len(peak_h))
+    small_pct = 100.0 * len([h for h in peak_h if h < 1000]) / float(len(peak_h))
     check('the small-peak slice is a minority of the peaks',
           5.0 < small_pct < 40.0,
-          '%.0f%% of %d peaks are under 500 counts (the slice is %d%%)'
+          '%.0f%% of %d peaks are under 1000 counts (the slice is %d%%)'
           % (small_pct, len(peak_h), cfg['frontier_pct']))
 
     total = len(glitch_w) + len(peak_w)

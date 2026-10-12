@@ -32,7 +32,7 @@ double   gauss() {   // Box-Muller
     return std::sqrt(-2.0 * std::log(u1)) * std::cos(6.283185307179586 * u2);
 }
 
-const double NOISE = 5.0;      // sigma of the baseline noise on every channel
+const double NOISE = 10.0;     // sigma of the baseline noise on every channel
 const double BASE  = 2000.0;
 
 struct PeakSpec { int center; double width; double amp; };
@@ -70,29 +70,29 @@ EventDetector::Config detectorConfig() {
     c.sigma_floor       = 1;
     c.quiet_samples     = 3000;    // DET_QUIET_SAMPLES
     c.quiet_seed_points = 128;     // DET_QUIET_SEED_POINTS
-    c.gate_max          = 160;     // DET_GATE_MAX
+    c.gate_max          = 320;     // DET_GATE_MAX
     c.end_debounce      = 2;       // DET_END_DEBOUNCE
     c.min_rise_samples  = 20;      // DET_MIN_RISE_SAMPLES (the rise test)
     c.dip_tolerance     = 3;       // DET_DIP_TOLERANCE
     // The scenarios here pin the window/group logic, so they state their own input
     // conditioning instead of inheriting whatever the firmware ships.  It is the
     // historical 3, not the shipped 7 (DET_IMPULSE_FILTER_TAPS): this signal's noise
-    // is a fresh gaussian draw of sigma 5 counts on every channel, so the 5*sigma
-    // start threshold (12-17 counts) sits far below min_max_value (80) and NO
+    // is a fresh gaussian draw of sigma 10 counts on every channel, so the 5*sigma
+    // start threshold (24-34 counts) sits far below min_max_value (160) and NO
     // excursion that could pass the amplitude bound is ever near it.  A longer
-    // median lowers the sigma estimate further (measured: 3.5 -> 2.3 counts, i.e.
-    // the start threshold drops from ~17 to ~12 counts), and then a 13-count noise
+    // median lowers the sigma estimate further (measured: 7.0 -> 4.6 counts, i.e.
+    // the start threshold drops from ~34 to ~24 counts), and then a 26-count noise
     // bump can start a rise candidate - which the rise test suppresses outright (it
     // has to last min_rise_samples before it is an event at all), so the group
     // bookkeeping these checks assert on is not perturbed by it.  The shipped filter
     // is covered end to end by test/test_bench_detect.cpp instead, which sweeps it at
     // every front-end width.
     c.impulse_filter_taps = 3;
-    c.min_max_value     = 80;      // DET_MIN_MAX_VALUE
+    c.min_max_value     = 160;     // DET_MIN_MAX_VALUE
     c.min_width_samples = 35;      // DET_MIN_WIDTH_SAMPLES (3.5 ms)
     c.max_width_samples = 20000;   // DET_MAX_WIDTH_SAMPLES (fault guard)
     c.min_area          = 0;       // DET_MIN_AREA
-    c.max_slope         = 100.0f;  // DET_MAX_SLOPE
+    c.max_slope         = 200.0f;  // DET_MAX_SLOPE
     return c;
 }
 
@@ -152,8 +152,8 @@ static char g_msg[256];
 // 1. LINKED: the primary channel times the event for everyone
 // ---------------------------------------------------------------------------
 static void testLinked() {
-    const PeakSpec peaks8[] = { {6000, 200, 800.0}, {13000, 200, 800.0}, {20000, 200, 800.0} };
-    const PeakSpec peaks0[] = { {6000, 200, 400.0}, {13000, 200, 400.0}, {20000, 200, 400.0} };
+    const PeakSpec peaks8[] = { {6000, 200, 1600.0}, {13000, 200, 1600.0}, {20000, 200, 1600.0} };
+    const PeakSpec peaks0[] = { {6000, 200, 800.0}, {13000, 200, 800.0}, {20000, 200, 800.0} };
     const ChannelSpec specs[] = {
         {0, BASE, peaks0, 3},        // same peaks, half the height
         {1, BASE, nullptr, 0},       // pure noise: reported as absent
@@ -220,12 +220,12 @@ static void testLinked() {
         CHECK(c8->flags == CH_FLAG_PRESENT, "LINKED #%d ch8: flags 0x%02x",
               e, (unsigned)c8->flags);
         CHECK(c8->reason == REASON_OK, "LINKED #%d ch8: reason %u", e, (unsigned)c8->reason);
-        CHECK(near(c8->max_value, 650, 950), "LINKED #%d ch8: height %d, expected ~800",
+        CHECK(near(c8->max_value, 1300, 1900), "LINKED #%d ch8: height %d, expected ~1600",
               e, (int)c8->max_value);
 
         CHECK(c0->flags == CH_FLAG_PRESENT, "LINKED #%d ch0: flags 0x%02x", e,
               (unsigned)c0->flags);
-        CHECK(near(c0->max_value, 250, 550), "LINKED #%d ch0: height %d, expected ~400",
+        CHECK(near(c0->max_value, 500, 1100), "LINKED #%d ch0: height %d, expected ~800",
               e, (int)c0->max_value);
         CHECK(c0->max_value < c8->max_value, "LINKED #%d: ch0 (%d) not smaller than ch8 (%d)",
               e, (int)c0->max_value, (int)c8->max_value);
@@ -239,7 +239,7 @@ static void testLinked() {
               (unsigned)c1->flags);
         CHECK(c1->reason == REASON_MAX_TOO_SMALL, "LINKED #%d ch1: reason %u", e,
               (unsigned)c1->reason);
-        CHECK(c1->max_value < 80, "LINKED #%d ch1: height %d, expected noise only",
+        CHECK(c1->max_value < 160, "LINKED #%d ch1: height %d, expected noise only",
               e, (int)c1->max_value);
     }
 
@@ -264,8 +264,8 @@ static void testLinked() {
 static void testLinkedClip() {
     // ch8 opens the window at ~6000 and closes it at ~6600; ch0 only rises at
     // 7000, so the window cuts it off while it is still climbing.
-    const PeakSpec peaks8[] = { {6000, 200, 800.0} };
-    const PeakSpec peaks0[] = { {7000, 200, 800.0} };
+    const PeakSpec peaks8[] = { {6000, 200, 1600.0} };
+    const PeakSpec peaks0[] = { {7000, 200, 1600.0} };
     const ChannelSpec specs[] = {
         {0, BASE, peaks0, 1},
         {1, BASE, nullptr, 0},
@@ -290,9 +290,9 @@ static void testLinkedClip() {
     CHECK(c0->flags == (CH_FLAG_PRESENT | CH_FLAG_TRUNCATED),
           "clip: ch0 flags 0x%02x, expected PRESENT|TRUNCATED", (unsigned)c0->flags);
     CHECK(c8->flags == CH_FLAG_PRESENT, "clip: ch8 flags 0x%02x", (unsigned)c8->flags);
-    CHECK(c0->max_value > 0 && c0->max_value < 300,
-          "clip: ch0 height %d, expected the window edge (~100)", (int)c0->max_value);
-    CHECK(near(c8->max_value, 650, 950), "clip: ch8 height %d, expected ~800",
+    CHECK(c0->max_value > 0 && c0->max_value < 600,
+          "clip: ch0 height %d, expected the window edge (~200)", (int)c0->max_value);
+    CHECK(near(c8->max_value, 1300, 1900), "clip: ch8 height %d, expected ~1600",
           (int)c8->max_value);
     CHECK(c0->max_value < c8->max_value, "clip: ch0 (%d) not clipped below ch8 (%d)",
           (int)c0->max_value, (int)c8->max_value);
@@ -317,10 +317,10 @@ static void testLinkedClip() {
 static void testPerChannel() {
     // Four peaks that overlap in time but have very different widths: ch0 broad,
     // ch1 narrow, ch8 medium, ch9 in between.
-    const PeakSpec peaks0[] = { {6000, 200, 800.0}, {13000, 200, 800.0} };
-    const PeakSpec peaks1[] = { {6100,  60, 600.0}, {13100,  60, 600.0} };
-    const PeakSpec peaks8[] = { {6020, 150, 700.0}, {13020, 150, 700.0} };
-    const PeakSpec peaks9[] = { {5970, 100, 500.0}, {12970, 100, 500.0} };
+    const PeakSpec peaks0[] = { {6000, 200, 1600.0}, {13000, 200, 1600.0} };
+    const PeakSpec peaks1[] = { {6100,  60, 1200.0}, {13100,  60, 1200.0} };
+    const PeakSpec peaks8[] = { {6020, 150, 1400.0}, {13020, 150, 1400.0} };
+    const PeakSpec peaks9[] = { {5970, 100, 1000.0}, {12970, 100, 1000.0} };
     const ChannelSpec specs[] = {
         {0, BASE, peaks0, 2},
         {1, BASE, peaks1, 2},
@@ -384,7 +384,7 @@ static void testPerChannel() {
         CHECK(b.width_samples >= c1->width_samples,
               "PER_CHANNEL #%d: window %u is shorter than the narrow channel %u",
               e, (unsigned)b.width_samples, (unsigned)c1->width_samples);
-        CHECK(near(c1->max_value, 500, 700), "PER_CHANNEL #%d ch1: height %d, expected ~600",
+        CHECK(near(c1->max_value, 1000, 1400), "PER_CHANNEL #%d ch1: height %d, expected ~1200",
               e, (int)c1->max_value);
         CHECK(c1->area > 0 && c1->area < c0->area,
               "PER_CHANNEL #%d: ch1 area %llu vs ch0 %llu", e,
@@ -416,14 +416,14 @@ static void testRail() {
     for (int i = 0; i < 14000; i++) {
         int32_t v[SORTER_MAX_CHANNELS];
         for (int c = 0; c < SORTER_MAX_CHANNELS; c++) { v[c] = 0; }
-        v[0] = (int32_t)std::lround(2000.0 + gauss() * 5.0);
-        v[1] = (int32_t)std::lround(2000.0 + gauss() * 5.0);
+        v[0] = (int32_t)std::lround(2000.0 + gauss() * 10.0);
+        v[1] = (int32_t)std::lround(2000.0 + gauss() * 10.0);
 
-        double x8 = 2000.0 + gauss() * 5.0;
+        double x8 = 2000.0 + gauss() * 10.0;
         if (i >= 4000 && i < 4200) { x8 = 32700.0; }            // bright burst: saturates
         if (i >= 8000 && i < 10000) {                           // normal peak after recovery
             const double d = (double)(i - 9000);
-            x8 += 800.0 * std::exp(-(d * d) / (2.0 * 200.0 * 200.0));
+            x8 += 1600.0 * std::exp(-(d * d) / (2.0 * 200.0 * 200.0));
         }
         v[8] = (int32_t)std::lround(x8);
 
@@ -446,8 +446,8 @@ static void testRail() {
             } else if (rec.bundle.valid) {
                 valid++;
                 const ChannelMetrics* c8 = findChannel(rec, 8);
-                CHECK(c8 && near(c8->max_value, 650, 950),
-                      "rail: post-recovery height %d, expected ~800",
+                CHECK(c8 && near(c8->max_value, 1300, 1900),
+                      "rail: post-recovery height %d, expected ~1600",
                       c8 ? (int)c8->max_value : -1);
             }
         }
@@ -470,11 +470,11 @@ static void testInvert() {
         int32_t v[SORTER_MAX_CHANNELS];
         for (int c = 0; c < SORTER_MAX_CHANNELS; c++) { v[c] = 0; }
 
-        double x8 = 25000.0 + gauss() * 5.0;                    // idles HIGH ...
+        double x8 = 25000.0 + gauss() * 10.0;                   // idles HIGH ...
         for (int k = 0; k < 2; k++) {                           // ... dips on an event
             const int    center = (k == 0) ? 6000 : 13000;
             const double d = (double)(i - center);
-            x8 -= 800.0 * std::exp(-(d * d) / (2.0 * 200.0 * 200.0));
+            x8 -= 1600.0 * std::exp(-(d * d) / (2.0 * 200.0 * 200.0));
         }
         v[8] = (int32_t)std::lround(x8);
 
@@ -486,8 +486,8 @@ static void testInvert() {
             if (rec.bundle.valid) {
                 valid++;
                 const ChannelMetrics* c8 = findChannel(rec, 8);
-                CHECK(c8 && near(c8->max_value, 600, 1000),
-                      "invert: ch8 height %d, expected ~800 (the dip depth)",
+                CHECK(c8 && near(c8->max_value, 1200, 2000),
+                      "invert: ch8 height %d, expected ~1600 (the dip depth)",
                       c8 ? (int)c8->max_value : -1);
             }
         }

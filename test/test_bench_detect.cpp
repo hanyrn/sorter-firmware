@@ -77,9 +77,9 @@
 //                its own (the rungs below the floor are the measurement, so the bench
 //                contract "every injected peak is reported" does not apply)
 //   --ladder-width N  width of every ladder rung in samples (default 600 = 60 ms).
-//   --ladder-min N    apex of the bottom rung in counts (default 20)
-//   --ladder-step N   counts between rungs (default 40)
-//   --ladder-count N  rungs drawn (default 12: 20 .. 460 counts)
+//   --ladder-min N    apex of the bottom rung in counts (default 40)
+//   --ladder-step N   counts between rungs (default 80)
+//   --ladder-count N  rungs drawn (default 12: 40 .. 920 counts)
 //                All four only move this run - SIGNALGEN_LADDER_* in config.h is what
 //                ships.  The floor is a staircase in width as well, so a fine min/step
 //                at one width, then `--ladder-width 200 / 1200`, walks the table.
@@ -128,12 +128,12 @@ const uint32_t kMinWidthSamples = 35u;                // DET_MIN_WIDTH_SAMPLES
 // settled by the measurement rather than by the model - see rejectionJustified().
 const uint32_t kWidthResolve    = 4u;                 // 0.4 ms at 10 kSPS
 const uint32_t kDipTolerance    = 3u;                 // DET_DIP_TOLERANCE
-const float    kAdcPerDac       = 2.64f;              // SIGNALGEN_ADC_PER_DAC (+/-10 V)
+const float    kAdcPerDac       = 5.28f;              // SIGNALGEN_ADC_PER_DAC (+/-5 V)
 const int32_t  kNoiseCode       = 16;                 // SIGNALGEN_NOISE_CODE
 const int32_t  kBaselineCode    = 2048;               // SIGNALGEN_BASELINE_CODE
 const int32_t  kMinCode         = 250;                // SIGNALGEN_MIN_CODE
 const int32_t  kMaxCode         = 3850;               // SIGNALGEN_MAX_CODE
-// The slow wander of the DC level: 150 DAC codes (+/-396 counts at +/-10 V) over one
+// The slow wander of the DC level: 150 DAC codes (+/-792 counts at +/-5 V) over one
 // 30 s sine at 10 kSPS.  It is part of the *signal*, not of the noise, so the truth
 // the detector is judged against has to carry it too (see cleanCode below).
 const int32_t  kBaselineWaveCode    = 150;            // SIGNALGEN_BASELINE_WAVE_CODE
@@ -143,8 +143,8 @@ const uint32_t kBaselineWaveSamples = 300000u;        // SIGNALGEN_BASELINE_WAVE
 // the detector's floor.  config.h's SIGNALGEN_LADDER_* block has the reasoning and the
 // measured floor; these are its numbers, mirrored like every other k* above.
 const uint32_t kLadderWidth = 600u;                   // SIGNALGEN_LADDER_WIDTH
-const int32_t  kLadderMin   = 20;                     // SIGNALGEN_LADDER_MIN
-const int32_t  kLadderStep  = 40;                     // SIGNALGEN_LADDER_STEP
+const int32_t  kLadderMin   = 40;                     // SIGNALGEN_LADDER_MIN
+const int32_t  kLadderStep  = 80;                     // SIGNALGEN_LADDER_STEP
 const uint32_t kLadderCount = 12u;                    // SIGNALGEN_LADDER_COUNT
 
 // One run's ladder: the shipped numbers above, overridable per run so the staircase can
@@ -171,16 +171,16 @@ EventAggregator::Config benchConfig() {
     d.sigma_floor         = 1;        // DET_SIGMA_FLOOR
     d.quiet_samples       = kQuietSamples;      // DET_QUIET_SAMPLES
     d.quiet_seed_points   = 128u;     // DET_QUIET_SEED_POINTS
-    d.gate_max            = 160u;     // DET_GATE_MAX
+    d.gate_max            = 320u;     // DET_GATE_MAX
     d.min_rise_samples    = kMinRiseSamples;    // DET_MIN_RISE_SAMPLES (the rise test)
     d.dip_tolerance       = kDipTolerance;      // DET_DIP_TOLERANCE
     d.end_debounce        = kEndDebounce;       // DET_END_DEBOUNCE
     d.impulse_filter_taps = 7;        // DET_IMPULSE_FILTER_TAPS
-    d.min_max_value       = 80;       // DET_MIN_MAX_VALUE
+    d.min_max_value       = 160;      // DET_MIN_MAX_VALUE
     d.min_width_samples   = kMinWidthSamples;   // DET_MIN_WIDTH_SAMPLES
     d.max_width_samples   = 20000u;   // DET_MAX_WIDTH_SAMPLES
     d.min_area            = 0ull;     // DET_MIN_AREA
-    d.max_slope           = 100.0f;   // DET_MAX_SLOPE
+    d.max_slope           = 200.0f;   // DET_MAX_SLOPE
 
     c.channel_mask = kActiveMask;
     c.mode         = METRIC_MODE_LINKED;
@@ -1224,6 +1224,36 @@ void classifyEvents(const RunResult& r, Counters& c, bool detail,
         c.by_reason[(e.reason < 8u) ? e.reason : 7u]++;
         if ((e.ch0_flags & CH_FLAG_TRUNCATED) != 0u) { c.trunc_ch0++; }
         if ((e.ch8_flags & CH_FLAG_TRUNCATED) != 0u) { c.trunc_ch8++; }
+        // The window ended while this channel was still inside its excursion: say which
+        // event, so the span behind it can be looked at instead of hunted for.
+        if (detail && (e.ch0_flags & CH_FLAG_TRUNCATED) != 0u) {
+            std::printf("      TRUNCATED: event #%u [%u..%u) w=%u (%.1f ms) judged %u  %s "
+                        "%s  ch0 max %d flags 0x%02x / ch%d max %d flags 0x%02x  "
+                        "span #%d (%d peaks, %d glitches, last %d)\n",
+                        (unsigned)ei, (unsigned)e.start, (unsigned)e.end,
+                        (unsigned)e.width, (double)e.width * 0.1, (unsigned)e.judged,
+                        e.valid ? "VALID" : "rejected", reasonName(e.reason),
+                        (int)e.ch0_max, (unsigned)e.ch0_flags, (int)kPrimaryCh,
+                        (int)e.ch8_max, (unsigned)e.ch8_flags, e.span_first, e.n_peaks,
+                        e.n_rect, e.span_last);
+            printWindowSamples(r, e.start - 30u, e.end + 40u);
+            // What the detector actually worked on: its input as counts above the shadow
+            // detector's own baseline, next to the clean excursion the model drew.
+            const uint32_t lo = (e.start > 40u) ? (e.start - 40u) : 0u;
+            const uint32_t hi = (uint32_t)((e.end + 20u < r.dirty8.size())
+                                          ? (e.end + 20u) : r.dirty8.size());
+            std::printf("              i      dirty-base   model   sigma\n");
+            for (uint32_t i = lo; i < hi; i++) {
+                const char* mark = "";
+                if (i >= e.start && i < e.end) { mark = "  <- window"; }
+                std::printf("              %6u %10d %7d %7.1f%s\n", (unsigned)i,
+                            (int)(r.dirty8[i] - r.ref_base[i]), (int)r.excursion[i],
+                            (double)r.ref_sigma[i], mark);
+            }
+            if (e.span_first >= 0) {
+                printSpan(r, r.spans[(std::size_t)e.span_first]);
+            }
+        }
 
         if (e.valid && e.n_peaks == 0 && !e.warmup) {
             if (e.n_rect > 0) { c.ghost_glitch++; } else { c.ghost_spike++; }

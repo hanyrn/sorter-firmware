@@ -225,15 +225,15 @@ public:
                                           // over [width_min, width_mean] instead -
                                           // the needles, in every cycle (see the
                                           // notes at the top of this file)
-        float    height_mean = 900.0f;    // AD7606 counts above the baseline (nominal)
-        float    height_sd   = 300.0f;
+        float    height_mean = 1800.0f;   // AD7606 counts above the baseline (nominal)
+        float    height_sd   = 600.0f;
         uint32_t height_span_pct = 30u;   // percent of peaks drawn log-uniform over the
                                           // *whole* [height_min, height_max] span
                                           // instead - that is what guarantees the
                                           // extremes appear in every cycle
-        int32_t  height_min  = 160;       // counts: about 1.3 * k_on * sigma, i.e. the
+        int32_t  height_min  = 320;       // counts: about 1.3 * k_on * sigma, i.e. the
                                           // smallest apex the detector can still see
-        int32_t  height_max  = 20000;     // counts: beyond what the DAC can output, so
+        int32_t  height_max  = 40000;     // counts: beyond what the DAC can output, so
                                           // the top of the span saturates the source
         // ---- the small-peak ("frontier") slice ------------------------------
         // What the height draw above cannot guarantee: a *small* apex on a pulse
@@ -249,8 +249,8 @@ public:
                                              // the floor (it is k_on * sigma, plus
                                              // DET_MIN_MAX_VALUE on the reported max)
                                              // - config.h has it, measured
-        int32_t  frontier_trigger = 100;     // counts: the on-threshold the apex is
-                                             // judged against (k_on * sigma: +52..59
+        int32_t  frontier_trigger = 200;     // counts: the on-threshold the apex is
+                                             // judged against (k_on * sigma: +104..118
                                              // measured on the filtered stream)
         uint32_t frontier_rise    = 20u;     // samples of leading edge it must show
                                              // (DET_MIN_RISE_SAMPLES)
@@ -259,8 +259,8 @@ public:
         // ---- the floor ladder (SIGNALGEN_LADDER_*) --------------------------
         // The one thing the random train above cannot present: a *small* apex with the
         // trace at the baseline on both sides.  Its gaps are 3..90 ms against 120 ms
-        // pulses and 80 % of its pulses fuse with a neighbour, so a 300-count apex is
-        // normally a shoulder on a 900-count slope, and on a plot whose scale is set by
+        // pulses and 80 % of its pulses fuse with a neighbour, so a 600-count apex is
+        // normally a shoulder on a 1800-count slope, and on a plot whose scale is set by
         // the train's own range (the DAC clamp) it is a couple of pixels - which is
         // exactly what makes "how close to the baseline can an apex be and still be
         // detected" unanswerable on the plot.
@@ -275,19 +275,19 @@ public:
         // has the numbers, the reasoning and how to run it.
         uint32_t ladder       = 0u;      // 0 = the random train above, 1 = the ladder
         uint32_t ladder_width = 600u;    // samples (60 ms): the width every rung has
-        int32_t  ladder_min   = 20;      // counts: the bottom rung's apex - well inside
-                                         // the +/-42-count dither band, so the staircase
+        int32_t  ladder_min   = 40;      // counts: the bottom rung's apex - well inside
+                                         // the +/-84-count dither band, so the staircase
                                          // starts where no apex can be told from noise
-        int32_t  ladder_step  = 40;      // counts between neighbouring rungs
+        int32_t  ladder_step  = 80;      // counts between neighbouring rungs
         uint32_t ladder_count = 12u;     // rungs: min .. min + step * (count - 1):
-                                         // 20, 60 ... 460 counts at the values above
+                                         // 40, 120 ... 920 counts at the values above
         // ---- rectangular glitches (deliberate false peaks) -----------------
         uint32_t glitch_pct = 40u;        // percent of pulses that are glitches
         uint32_t glitch_width_max = 6u;   // glitch width is uniform in 1..this
-        float    glitch_height_mean = 1800.0f;
-        float    glitch_height_sd   = 1100.0f;
-        int32_t  glitch_height_min  = 120;
-        int32_t  glitch_height_max  = 20000;
+        float    glitch_height_mean = 3600.0f;
+        float    glitch_height_sd   = 2200.0f;
+        int32_t  glitch_height_min  = 240;
+        int32_t  glitch_height_max  = 40000;
         // ---- waveform / scaling -------------------------------------------
         int32_t  baseline_code = 2048;    // DC level in DAC codes (~1.65 V)
         int32_t  noise_code    = 16;      // dither amplitude in DAC codes (~13 mV)
@@ -295,7 +295,7 @@ public:
         // ---- slow baseline wander ------------------------------------------
         int32_t  baseline_wave_code    = 150;     // the DC level itself drifts,
                                                   // +/- this many DAC codes
-                                                  // (~+/-396 AD counts at +/-10 V,
+                                                  // (~+/-792 AD counts at +/-5 V,
                                                   // i.e. many sigma of the dither)
         uint32_t baseline_wave_samples = 300000u; // one full sine period is this many
                                                   // samples - 30 s at 10 kSPS, so the
@@ -305,11 +305,11 @@ public:
                                                   // event
         float    spike_pct     = 0.05f;   // percent of samples carrying an impulse
         int32_t  spike_max     = 400;     // impulse height, uniform in +/- this (DAC
-                                          // codes: ~+/-1056 AD counts at +/-10 V, i.e.
+                                          // codes: ~+/-2112 AD counts at +/-5 V, i.e.
                                           // as tall as a nominal peak)
         int32_t  min_code      = 250;     // DAC output buffer linear window
         int32_t  max_code      = 3850;    // ... and the clip point of a saturated peak
-        float    adc_per_dac   = 2.64f;   // AD7606 counts per DAC count (see config.h)
+        float    adc_per_dac   = 5.28f;   // AD7606 counts per DAC count (see config.h)
         uint32_t seed          = 0x2F6E2B1u;
     };
 

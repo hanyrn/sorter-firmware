@@ -298,23 +298,23 @@ bool defaultsMatchConfig() {
            std::fabs(c.merge_min_overlap - 0.12f) < 1e-6f &&
            c.width_mean == 1200.0f && c.width_sd == 260.0f &&
            c.width_min == 30u && c.width_max == 3000u && c.width_span_pct == 40u &&
-           c.height_mean == 900.0f && c.height_sd == 300.0f &&
-           c.height_span_pct == 30u && c.height_min == 160 && c.height_max == 20000 &&
+           c.height_mean == 1800.0f && c.height_sd == 600.0f &&
+           c.height_span_pct == 30u && c.height_min == 320 && c.height_max == 40000 &&
            c.frontier_pct == 50u && c.frontier_width_min == 200u &&
-           c.frontier_width_max == 800u && c.frontier_trigger == 100 &&
+           c.frontier_width_max == 800u && c.frontier_trigger == 200 &&
            c.frontier_rise == 20u &&
            std::fabs(c.frontier_margin_min - 2.5f) < 1e-6f &&
            std::fabs(c.frontier_margin_max - 5.0f) < 1e-6f &&
-           c.ladder == 0u && c.ladder_width == 600u && c.ladder_min == 20 &&
-           c.ladder_step == 40 && c.ladder_count == 12u &&
+           c.ladder == 0u && c.ladder_width == 600u && c.ladder_min == 40 &&
+           c.ladder_step == 80 && c.ladder_count == 12u &&
            c.glitch_pct == 40u && c.glitch_width_max == 6u &&
-           c.glitch_height_mean == 1800.0f && c.glitch_height_sd == 1100.0f &&
-           c.glitch_height_min == 120 && c.glitch_height_max == 20000 &&
+           c.glitch_height_mean == 3600.0f && c.glitch_height_sd == 2200.0f &&
+           c.glitch_height_min == 240 && c.glitch_height_max == 40000 &&
            c.baseline_code == 2048 && c.noise_code == 16 && c.noise_alpha == 1.0f &&
            c.baseline_wave_code == 150 && c.baseline_wave_samples == 300000u &&
            std::fabs(c.spike_pct - 0.05f) < 1e-6f && c.spike_max == 400 &&
            c.min_code == 250 && c.max_code == 3850 && c.seed == 0x2F6E2B1u &&
-           std::fabs(c.adc_per_dac - 2.64f) < 1e-6f;
+           std::fabs(c.adc_per_dac - 5.28f) < 1e-6f;
 }
 
 void checkMean(const char* name, double got, double want, double tol,
@@ -628,7 +628,7 @@ int main() {
         // *mixed* median down on purpose (it is the small end of the train), so the
         // nominal figure is measured with it out of the way.
         checkMean("peak height median ~ height_mean (the nominal draw alone)",
-                  median(nominal_h), (double)cfg.height_mean, 120.0, "codes");
+                  median(nominal_h), (double)cfg.height_mean, 240.0, "codes");
     }
 
     const double narrowest = *std::min_element(st.peak_w.begin(), st.peak_w.end());
@@ -655,12 +655,12 @@ int main() {
     {
         int small = 0;
         for (size_t i = 0; i < st.peak_h.size(); i++) {
-            if (st.peak_h[i] < 500.0) { small++; }
+            if (st.peak_h[i] < 1000.0) { small++; }
         }
         const double small_pct = 100.0 * (double)small / (double)st.peak_h.size();
         check("the small-peak slice is a minority of the peaks",
               small_pct > 5.0 && small_pct < 40.0,
-              "%.0f%% of %u peaks are under 500 counts (the slice is %u%%)",
+              "%.0f%% of %u peaks are under 1000 counts (the slice is %u%%)",
               small_pct, (unsigned)st.peak_h.size(), (unsigned)cfg.frontier_pct);
     }
 
@@ -669,7 +669,7 @@ int main() {
     checkMean("glitch width mean ~ 1..glitch_width_max", gw.mean,
               (1.0 + (double)cfg.glitch_width_max) / 2.0, 0.75, "smp");
     checkMean("glitch height mean ~ glitch_height_mean", gh.mean,
-              (double)cfg.glitch_height_mean, 180.0, "codes");
+              (double)cfg.glitch_height_mean, 360.0, "codes");
 
     const double share = (pulses > 0.0) ? 100.0 * (double)st.glitch_w.size() / pulses
                                         : 0.0;
