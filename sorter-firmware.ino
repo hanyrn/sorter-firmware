@@ -144,6 +144,10 @@ static EventAggregator::Config makeAggregatorConfig() {
     c.channel_mask = SORTER_ACTIVE_CHANNEL_MASK;
     c.mode         = SORTER_METRIC_MODE ? METRIC_MODE_LINKED : METRIC_MODE_PER_CHANNEL;
     c.primary      = (uint8_t)SORTER_PRIMARY_CHANNEL;
+    // PER_CHANNEL: how far the channels' widths may differ and still count as the
+    // same event, so one unplugged channel cannot speak for the bundle (see
+    // SORTER_PC_WIDTH_AGREE_PCT in config.h).
+    c.width_agree_pct = SORTER_PC_WIDTH_AGREE_PCT;
     c.rail_level    = DET_RAIL_LEVEL;
     c.rail_width    = DET_RAIL_WIDTH;
     c.rail_cooldown = DET_RAIL_COOLDOWN;
@@ -301,7 +305,11 @@ static void printBundle(const EventRecord& rec) {
             continue;
         }
         if ((c.flags & CH_FLAG_PRESENT) == 0u) {
-            Serial.println("  absent");
+            // No peak of its own: its tracker's DC level is all there is to report,
+            // and it is what shows a quiet input (an unplugged DAC, say) for what it
+            // is - flat on its own baseline - in per-channel mode.
+            Serial.print("  absent  base="); Serial.print(c.baseline);
+            Serial.println();
             continue;
         }
         Serial.print("  max=");     Serial.print(c.max_value);

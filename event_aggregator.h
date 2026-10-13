@@ -29,7 +29,12 @@
 //       widths legitimately differ from channel to channel.  The event is reported
 //       once ALL channels that entered it have closed again; a channel that never
 //       drops back is closed by the detector's own max_width_samples guard, so an
-//       event can never hang.
+//       event can never hang.  The bundle's own verdict still comes from ONE
+//       channel, because the fault guard also closes a channel whose input is
+//       broken (unplugged / floating): that channel measures *an* event, but not
+//       the one the wired channels saw, so it neither speaks for the bundle nor
+//       paces its assembly.  See choosePerChannelVerdict() and
+//       SORTER_PC_WIDTH_AGREE_PCT.
 //
 // This file has no Arduino dependency (same as event_detector.h) and is therefore
 // unit-testable on a host (test/test_event_aggregator.cpp).
@@ -77,6 +82,10 @@ public:
         uint32_t channel_mask = 0x0000FFFFu;  // channels that are measured/reported
         MetricMode mode       = METRIC_MODE_LINKED;
         uint8_t  primary      = 0xFFu;        // window reference; 0xFF = first active
+        // PER_CHANNEL only: how far two channels' judged widths may differ and still
+        // be taken as measuring the same event, in percent of the wider one.  0
+        // switches the test off.  See SORTER_PC_WIDTH_AGREE_PCT in config.h.
+        uint32_t width_agree_pct = 50;
 
         // ---- saturation ("rail") guard ------------------------------------
         // A sample with |x| >= rail_level is beyond the ADC range, where the
@@ -122,6 +131,23 @@ private:
     // metrics to report.  A group in which every channel's candidate was suppressed has
     // nothing to report and is dropped (see updatePerChannel).
     bool anyPcDone() const;
+
+    // PER_CHANNEL: which channel's own verdict becomes the bundle's verdict.
+    //   pcMeasuredOk(ch)  - the channel has metrics and its verdict is a valid peak.
+    //   pcGuardClosed(ch) - its event was closed by the detector's max_width_samples
+    //                       fault guard: it never came back to its baseline (an
+    //                       unplugged / floating input), so the width it reports is
+    //                       the guard's bound and not the event's.
+    //   pcSpeaks(ch)      - measured the event, was not fault-closed, and is not
+    //                       outvoted: another channel measured it too and none of
+    //                       them agrees with this one's width.
+    // The bundle's verdict is the primary when it speaks, else the lowest channel that
+    // does, else the lowest channel that measured the event at all, else none.
+    bool     pcMeasuredOk(uint8_t ch) const;
+    bool     pcGuardClosed(uint8_t ch) const;
+    bool     pcSpeaks(uint8_t ch) const;
+    uint8_t  choosePerChannelVerdict() const;
+    static bool widthsAgree(uint32_t a, uint32_t b, uint32_t pct);
 
     void openWindow();                                   // LINKED: freeze the references
     void accumulate(uint8_t ch, int32_t x, uint32_t index);  // LINKED: clip one channel
@@ -173,6 +199,13 @@ private:
     PeakMetrics  pc_metrics_[SORTER_MAX_CHANNELS];
     bool         pc_done_[SORTER_MAX_CHANNELS];
     bool         pc_in_[SORTER_MAX_CHANNELS]; // channel is inside the open group
+    // A channel whose last event was closed by the detector's max_width_samples fault
+    // guard never came back to its baseline: an unplugged or floating input, whose
+    // "event" is the guard's bound and not the one the other channels measured.  It is
+    // held out of the group until it closes an event normally again, so its fault can
+    // neither pace the bundle nor (see choosePerChannelVerdict) speak for it - while
+    // still being reported in its own row.
+    bool         pc_fault_[SORTER_MAX_CHANNELS];
 };
 
 // ===========================================================================
@@ -222,6 +255,7 @@ inline void EventAggregator::reset() {
         win_high_[ch] = false;
         pc_done_[ch]  = false;
         pc_in_[ch]    = false;
+        pc_fault_[ch] = false;
         rail_count_[ch]   = 0;
         rail_holdoff_[ch] = 0;
         rail_skip_[ch]    = false;
@@ -564,7 +598,8 @@ inline void EventAggregator::buildLinkedRecord(const PeakMetrics& ref, EventReco
 }
 
 // ---------------------------------------------------------------------------
-// PER_CHANNEL: every channel times itself, the bundle waits for the last one
+// PER_CHANNEL: every channel times itself, the bundle waits for the last channel
+// that is actually measuring it (a fault-closed one is held out - see pc_fault_)
 // ---------------------------------------------------------------------------
 inline bool EventAggregator::updatePerChannel(const int32_t* channels, uint32_t t_us,
                                               uint32_t index, EventRecord& out,
@@ -573,6 +608,8 @@ inline bool EventAggregator::updatePerChannel(const int32_t* channels, uint32_t 
     // uint8_t would silently drop channels 8..15 (module 1).
     uint16_t opened  = 0;  // channels whose own event started on this sample
     uint16_t closed  = 0;  // channels whose own event ended on this sample
+    uint16_t counted = 0;  // of those closed, the ones that were part of the open
+                           // group (a held-out fault closes without joining it)
     uint16_t dropped = 0;  // channels whose rise candidate was suppressed on this sample,
                            // or whose window closed without ever becoming one
 
@@ -587,14 +624,31 @@ inline bool EventAggregator::updatePerChannel(const int32_t* channels, uint32_t 
             continue;
         }
 
+        // A channel the fault guard closed last time is not measuring this event: it is
+        // held out of the group until it closes an event normally again (pc_fault_).  Its
+        // own detector keeps running - the fault still gets its own row, and closing
+        // normally is how it is seen to recover - but it cannot hold the group open.  One
+        // unplugged channel would otherwise pace the M4: this group cannot finish before
+        // that channel's own fault event does (on the bench: exactly max_width_samples
+        // after it opened, i.e. one bundle per 2 s instead of one per pulse).
+        const bool held = pc_fault_[ch];
+
         const bool was_in = det_[ch].inEvent();
         PeakMetrics m;
         const DetectorResult r = det_[ch].update(channels[ch], t_us, index, m);
-        if (!was_in && det_[ch].inEvent()) { opened |= (uint16_t)(1u << ch); pc_in_[ch] = true; }
+        if (!was_in && det_[ch].inEvent()) {
+            opened |= (uint16_t)(1u << ch);
+            if (!held) { pc_in_[ch] = true; }
+        }
         if (r == DET_CLOSED) {
             closed |= (uint16_t)(1u << ch);
+            if (pc_in_[ch]) { counted |= (uint16_t)(1u << ch); }
             pc_metrics_[ch] = m;    // this channel's own start/end/width/height/area
             pc_in_[ch]      = false;
+            // Did the fault guard close it?  Then it never came back to its baseline, so
+            // the width it reports is the guard's bound and not the event's: hold the
+            // channel out of the next groups until it closes one normally (see pc_fault_).
+            pc_fault_[ch] = (m.width_samples >= cfg_.detector.max_width_samples);
         } else if (r == DET_DISCARDED) {
             // Its rise candidate failed, so this channel was never in an event: it
             // has to leave the group, or the group would keep waiting for an event
@@ -622,7 +676,10 @@ inline bool EventAggregator::updatePerChannel(const int32_t* channels, uint32_t 
         for (uint8_t ch = 0; ch < SORTER_MAX_CHANNELS; ch++) {
             if ((closed & (uint16_t)(1u << ch)) == 0u) { continue; }
             pc_done_[ch] = true;
-            if (pc_pending_ > 0u) { pc_pending_--; }
+            // Only a channel that really was in the group may be counted down: a held-out
+            // one (pc_fault_) closes without ever having taken a place in it, and a stray
+            // decrement here would complete a group that is still open.
+            if ((counted & (uint16_t)(1u << ch)) != 0u && pc_pending_ > 0u) { pc_pending_--; }
         }
         group_done = (pc_pending_ == 0u);
     }
@@ -639,12 +696,20 @@ inline bool EventAggregator::updatePerChannel(const int32_t* channels, uint32_t 
     }
 
     // Opening channels form the next group (pc_pending_ is 0 again after an event
-    // was reported, so the first of them starts the new window).
+    // was reported, so the first of them starts the new window).  A held-out channel
+    // (pc_fault_) opens the window when nothing else is open - so the fault report it
+    // will produce is about the event it actually saw - but it does not take a place
+    // in the group: pc_in_ is what "in the group" means here.
     if (opened != 0u) {
+        bool window_set = false;
         for (uint8_t ch = 0; ch < SORTER_MAX_CHANNELS; ch++) {
             if ((opened & (uint16_t)(1u << ch)) == 0u) { continue; }
-            if (pc_pending_ == 0u) { pc_start_us_ = t_us; pc_start_ix_ = index; }
-            pc_pending_++;
+            if (pc_pending_ == 0u && !window_set) {
+                pc_start_us_ = t_us;
+                pc_start_ix_ = index;
+                window_set   = true;
+            }
+            if (pc_in_[ch]) { pc_pending_++; }
         }
     }
 
@@ -659,10 +724,67 @@ inline bool EventAggregator::anyPcDone() const {
     return false;
 }
 
+// Two judged widths come from the same event when they agree within `pct` percent of
+// the wider one; `pct == 0` switches the test off (every pair agrees).
+inline bool EventAggregator::widthsAgree(uint32_t a, uint32_t b, uint32_t pct) {
+    if (pct == 0u) { return true; }
+    const uint32_t hi = (a < b) ? b : a;
+    const uint32_t lo = (a < b) ? a : b;
+    if (hi == 0u) { return lo == 0u; }
+    return ((uint64_t)(hi - lo) * 100ull) <= ((uint64_t)hi * (uint64_t)pct);
+}
+
+inline bool EventAggregator::pcMeasuredOk(uint8_t ch) const {
+    return pc_done_[ch] && metricsValid(pc_metrics_[ch].reason);
+}
+
+inline bool EventAggregator::pcGuardClosed(uint8_t ch) const {
+    // The excursion, not the judged duration: the guard closes a channel exactly
+    // max_width_samples after its event started, so an excursion that reached the
+    // bound is a guard closure and nothing else (a return to the baseline earlier than
+    // that ends the excursion earlier).
+    return pc_done_[ch] && (pc_metrics_[ch].width_samples >= cfg_.detector.max_width_samples);
+}
+
+inline bool EventAggregator::pcSpeaks(uint8_t ch) const {
+    if (!pcMeasuredOk(ch) || pcGuardClosed(ch)) { return false; }
+    bool any_other = false;
+    for (uint8_t o = 0; o < SORTER_MAX_CHANNELS; o++) {
+        if (o == ch || !inMask(o)) { continue; }
+        if (!pcMeasuredOk(o) || pcGuardClosed(o)) { continue; }   // not a measurement
+        any_other = true;
+        if (widthsAgree(pc_metrics_[ch].duration_samples,
+                        pc_metrics_[o].duration_samples, cfg_.width_agree_pct)) {
+            return true;
+        }
+    }
+    // Nobody measured the event with it, so nothing outvoted it - the single connected
+    // channel of a partly unplugged harness is exactly this case.
+    return !any_other;
+}
+
+inline uint8_t EventAggregator::choosePerChannelVerdict() const {
+    if (primary_ < SORTER_MAX_CHANNELS && pcSpeaks(primary_)) { return primary_; }
+    for (uint8_t ch = 0; ch < SORTER_MAX_CHANNELS; ch++) {
+        if (inMask(ch) && pcSpeaks(ch)) { return ch; }
+    }
+    // Every channel that measured the event is fault-closed or outvoted: report the
+    // lowest one rather than pretending the event has no verdict at all.
+    for (uint8_t ch = 0; ch < SORTER_MAX_CHANNELS; ch++) {
+        if (inMask(ch) && pcMeasuredOk(ch)) { return ch; }
+    }
+    return 0xFFu;   // nothing measured: the bundle carries no verdict (as before)
+}
+
 inline void EventAggregator::buildPerChannelRecord(uint32_t t_us, uint32_t index,
                                                    EventRecord& out) {
-    uint8_t n          = 0;
-    uint8_t verdict_ch = 0xFFu;   // channel whose verdict becomes the event verdict
+    uint8_t n = 0;
+    // Who speaks for the bundle: the primary while it measured this event, else the
+    // lowest channel that did (see choosePerChannelVerdict).  A channel the fault guard
+    // closed, or one whose width no other measuring channel agrees with, is not the
+    // event's voice - one broken input must not hide what the wired channels measured.
+    // The rows below are untouched: every channel still reports its own metrics.
+    const uint8_t verdict_ch = choosePerChannelVerdict();
 
     for (uint8_t ch = 0; ch < SORTER_MAX_CHANNELS; ch++) {
         if (!inMask(ch)) { continue; }
@@ -670,7 +792,10 @@ inline void EventAggregator::buildPerChannelRecord(uint32_t t_us, uint32_t index
         ChannelMetrics cm;
         cm.channel       = ch;
         cm.flags         = 0;
-        cm.baseline      = 0;
+        // A channel that never rose has no peak, but it does have a DC level: report
+        // its own tracker's, so a quiet/unlinked input shows up in the log instead of
+        // reading as nothing but "absent".  (LINKED gets the same from win_base_.)
+        cm.baseline      = (int32_t)lroundf(det_[ch].baseline());
         cm.max_value     = 0;
         cm.width_samples = 0;
         cm.width_us      = 0;
@@ -686,9 +811,15 @@ inline void EventAggregator::buildPerChannelRecord(uint32_t t_us, uint32_t index
             cm.area          = m.area;
             cm.flags         = CH_FLAG_PRESENT;
             cm.reason        = m.reason;
-            if (m.reason == REASON_WIDTH_TOO_WIDE) { cm.flags |= CH_FLAG_TRUNCATED; }
-            // The primary channel speaks for the event when it took part.
-            if (verdict_ch == 0xFFu || ch == primary_) { verdict_ch = ch; }
+            // A channel the fault guard closed was cut off, not measured - which is what
+            // CH_FLAG_TRUNCATED says in linked mode too.  Its reason already reads
+            // WIDTH_TOO_WIDE when the envelope correction pushed the duration past the
+            // bound, but a fault-closed step is refused by the shape guard instead
+            // (SHORT_FOR_HEIGHT), and the flag has to name the fault either way: the M7
+            // and test/live_plot.py tell a cut row from a measured one by it.
+            if (m.reason == REASON_WIDTH_TOO_WIDE || pcGuardClosed(ch)) {
+                cm.flags |= CH_FLAG_TRUNCATED;
+            }
         }
         pc_done_[ch] = false;   // ready for the next group
         out.ch[n++] = cm;

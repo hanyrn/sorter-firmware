@@ -576,7 +576,7 @@ void printChannelLog(const ChannelMetrics& c, FILE* fh) {
         return;
     }
     if ((c.flags & CH_FLAG_PRESENT) == 0u) {
-        std::fprintf(fh, "  ch%u  absent\n", (unsigned)c.channel);
+        std::fprintf(fh, "  ch%u  absent  base=%d\n", (unsigned)c.channel, (int)c.baseline);
         return;
     }
     std::fprintf(fh, "  ch%u  max=%d  area=%u  width=%uus/%usmp  base=%d  ",

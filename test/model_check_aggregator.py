@@ -27,6 +27,10 @@ Scenarios
 3. PER_CHANNEL  : ch0, ch1, ch8 and ch9 all fire, but with different widths; the
                   widths must differ and every channel must report its own
                   metrics while the window covers the whole group.
+6. PC fault     : ch8 is unplugged - its input steps up and never returns, so the
+                  detector's max_width_samples guard closes its "event".  ch0's
+                  pulses must still be reported with ch0's verdict, and as they
+                  close rather than when ch8's fault finally does.
 
 Run:  python test/model_check_aggregator.py
 """
@@ -88,6 +92,10 @@ class AggConfig:
         self.channel_mask = 0x0000FFFF
         self.mode = MODE_LINKED
         self.primary = 0xFF
+        # PER_CHANNEL only: how far two channels' judged widths may differ and still
+        # be taken as measuring the same event, in percent of the wider one (0 = the
+        # test is off).  Mirrors EventAggregator::Config::width_agree_pct.
+        self.width_agree_pct = 50
         # saturation ("rail") guard: |sample| >= rail_level is clipped at full scale
         self.rail_level = 32000
         self.rail_width = 8
@@ -132,6 +140,9 @@ class EventAggregator:
         self.pc_metrics = [None] * MAX_CH
         self.pc_done = [False] * MAX_CH
         self.pc_in = [False] * MAX_CH
+        # Its last event was closed by the max_width_samples fault guard (unplugged /
+        # floating input): held out of the group until it closes one normally again.
+        self.pc_fault = [False] * MAX_CH
         self.rail_count = [0] * MAX_CH
         self.rail_holdoff = [0] * MAX_CH
         self.rail_skip = [False] * MAX_CH
@@ -352,6 +363,7 @@ class EventAggregator:
     def update_per_channel(self, channels, t_us, index):
         opened = 0
         closed = 0
+        counted = 0     # of those closed, the ones that were part of the group
         for ch in range(MAX_CH):
             if not self.in_mask(ch):
                 continue
@@ -363,15 +375,28 @@ class EventAggregator:
                     if self.pc_pending > 0:
                         self.pc_pending -= 1
                 continue
+            # A channel the fault guard closed last time is not measuring this event: it
+            # is held out of the group until it closes an event normally again (pc_fault).
+            # Its own detector keeps running - the fault still gets its own row, and
+            # closing normally is how it is seen to recover - but it cannot hold the group
+            # open.  Mirrors updatePerChannel() in event_aggregator.h.
+            held = self.pc_fault[ch]
             was_in = self.det[ch].in_event()
             m = self.det[ch].update(channels[ch], t_us, index)
             if not was_in and self.det[ch].in_event():
                 opened |= (1 << ch)
-                self.pc_in[ch] = True
+                if not held:
+                    self.pc_in[ch] = True
             if m is not None:
                 closed |= (1 << ch)
+                if self.pc_in[ch]:
+                    counted |= (1 << ch)
                 self.pc_metrics[ch] = m
                 self.pc_in[ch] = False
+                # Did the fault guard close it?  Then it never came back to its
+                # baseline, so its width is the guard's bound and not the event's.
+                self.pc_fault[ch] = (m["width_samples"] >=
+                                     self.cfg.detector.max_width_samples)
             elif was_in and not self.det[ch].in_event():
                 # The channel's own window closed without an event: a band breakout that
                 # never became one.  It was never in an event, so it leaves the group (see
@@ -386,26 +411,40 @@ class EventAggregator:
             for ch in range(MAX_CH):
                 if (closed >> ch) & 1:
                     self.pc_done[ch] = True
-                    if self.pc_pending > 0:
+                    # Only a channel that really was in the group may be counted down: a
+                    # held-out one (pc_fault) closes without ever having taken a place in
+                    # it, and a stray decrement would complete a group that is still open.
+                    if (counted >> ch) & 1 and self.pc_pending > 0:
                         self.pc_pending -= 1
             done = (self.pc_pending == 0)
 
         rec = self.build_per_channel_record(t_us, index) if done else None
 
         # A channel that opens on the very sample another group closed starts the
-        # next group (pc_pending is 0 again at this point).
+        # next group (pc_pending is 0 again at this point).  A held-out channel opens
+        # the window when nothing else is open - so the fault report it will produce is
+        # about the event it actually saw - but it does not take a place in the group:
+        # pc_in is what "in the group" means here.
         if opened != 0:
+            window_set = False
             for ch in range(MAX_CH):
                 if (opened >> ch) & 1:
-                    if self.pc_pending == 0:
+                    if self.pc_pending == 0 and not window_set:
                         self.pc_start_us = t_us
                         self.pc_start_ix = index
-                    self.pc_pending += 1
+                        window_set = True
+                    if self.pc_in[ch]:
+                        self.pc_pending += 1
         return rec
 
     def build_per_channel_record(self, t_us, index):
+        # Who speaks for the bundle (see choose_per_channel_verdict): the primary while it
+        # measured this event, else the lowest channel that did.  It has to be decided
+        # before the loop below consumes pc_done - that is what the C++ does too
+        # (buildPerChannelRecord clears pc_done on its way out).
+        verdict_ch = self.choose_per_channel_verdict()
+
         chans = []
-        verdict_ch = 0xFF
         for ch in range(MAX_CH):
             if not self.in_mask(ch):
                 continue
@@ -416,15 +455,21 @@ class EventAggregator:
                 m = self.pc_metrics[ch]
                 cm["baseline"] = m["baseline"]
                 cm["max_value"] = m["max_value"]
-                cm["width_samples"] = m["width_samples"]   # its own width
-                cm["width_us"] = m["width_us"]
+                # Its own judged width: the channel's excursion read back through its
+                # pulse's envelope (duration_samples/duration_us), not the excursion
+                # itself - widths may legitimately differ, that is the point of this mode.
+                cm["width_samples"] = m["duration_samples"]
+                cm["width_us"] = m["duration_us"]
                 cm["area"] = m["area"]
                 cm["flags"] = CH_FLAG_PRESENT
                 cm["reason"] = m["reason"]
-                if m["reason"] == mc.REASON_WIDTH_TOO_WIDE:
+                # A channel the fault guard closed was cut off, not measured - which is
+                # what CH_FLAG_TRUNCATED says in linked mode too.  Its reason already reads
+                # WIDTH_TOO_WIDE when the envelope correction pushed the duration past the
+                # bound, but a fault-closed step is refused by the shape guard instead
+                # (SHORT_FOR_HEIGHT), and the flag has to name the fault either way.
+                if m["reason"] == mc.REASON_WIDTH_TOO_WIDE or self.pc_guard_closed(ch):
                     cm["flags"] |= CH_FLAG_TRUNCATED
-                if verdict_ch == 0xFF or ch == self.primary:
-                    verdict_ch = ch
             self.pc_done[ch] = False
             chans.append(cm)
 
@@ -432,6 +477,7 @@ class EventAggregator:
             valid = 1 if self.pc_metrics[verdict_ch]["reason"] == mc.REASON_OK else 0
             reason = self.pc_metrics[verdict_ch]["reason"]
         else:
+            # Nothing measured the event: the bundle carries no verdict (as before).
             valid, reason = 0, mc.REASON_MAX_TOO_SMALL
 
         bundle = {
@@ -442,6 +488,62 @@ class EventAggregator:
         }
         self.pc_pending = 0
         return {"bundle": bundle, "ch": chans}
+
+    # -- PER_CHANNEL: which channel's verdict speaks for the bundle ----------
+    # Mirrors choosePerChannelVerdict() and its helpers in event_aggregator.h.  A channel
+    # that never came back to its baseline (the detector's max_width_samples fault guard
+    # closed its event) did see *an* event, but not the one the wired channels saw, so it
+    # must not speak for the bundle - nor may a channel whose judged width no other
+    # measuring channel agrees with (see width_agree_pct).
+    @staticmethod
+    def widths_agree(a, b, pct):
+        if pct == 0:
+            return True
+        hi, lo = (a, b) if a >= b else (b, a)
+        if hi == 0:
+            return lo == 0
+        return (hi - lo) * 100 <= hi * pct
+
+    def pc_measured_ok(self, ch):
+        return self.pc_done[ch] and self.pc_metrics[ch]["reason"] == mc.REASON_OK
+
+    def pc_guard_closed(self, ch):
+        # The excursion, not the judged duration: the guard closes a channel exactly
+        # max_width_samples after its event started, so an excursion that reached the
+        # bound is a guard closure and nothing else.
+        return (self.pc_done[ch] and
+                self.pc_metrics[ch]["width_samples"] >= self.cfg.detector.max_width_samples)
+
+    def pc_speaks(self, ch):
+        if not self.pc_measured_ok(ch) or self.pc_guard_closed(ch):
+            return False
+        any_other = False
+        for o in range(MAX_CH):
+            if o == ch or not self.in_mask(o):
+                continue
+            if not self.pc_measured_ok(o) or self.pc_guard_closed(o):
+                continue                       # not a measurement, so it cannot outvote
+            any_other = True
+            if self.widths_agree(self.pc_metrics[ch]["duration_samples"],
+                                 self.pc_metrics[o]["duration_samples"],
+                                 self.cfg.width_agree_pct):
+                return True
+        # Nobody measured the event with it, so nothing outvoted it - the single connected
+        # channel of a partly unplugged harness is exactly this case.
+        return not any_other
+
+    def choose_per_channel_verdict(self):
+        if 0 <= self.primary < MAX_CH and self.pc_speaks(self.primary):
+            return self.primary
+        for ch in range(MAX_CH):
+            if self.in_mask(ch) and self.pc_speaks(ch):
+                return ch
+        # Every channel that measured the event is fault-closed or outvoted: report the
+        # lowest one rather than pretending the event has no verdict at all.
+        for ch in range(MAX_CH):
+            if self.in_mask(ch) and self.pc_measured_ok(ch):
+                return ch
+        return 0xFF        # nothing measured: the bundle carries no verdict (as before)
 
     # -- RAIL: one notification bundle per rail episode ----------------------
     def build_rail_record(self, t_us):
@@ -679,9 +781,13 @@ def test_per_channel():
         if not 1 <= c1["width_us"] < c0["width_us"]:
             failures.append("event %d: ch1 width_us %d vs ch0 %d"
                             % (b["index"], c1["width_us"], c0["width_us"]))
-        if b["width_samples"] < c0["width_samples"]:
-            failures.append("event %d: window %d narrower than ch0 %d"
-                            % (b["index"], b["width_samples"], c0["width_samples"]))
+        # The window is the group's span; each channel's width is that channel's own
+        # duration.  Those are different quantities (see the note in test_linked): the
+        # widest channel's duration reaches past the window its excursion fit in, so the
+        # window is checked against the narrow channel - exactly like the C++ test.
+        if b["width_samples"] < c1["width_samples"]:
+            failures.append("event %d: window %d is shorter than the narrow channel %d"
+                            % (b["index"], b["width_samples"], c1["width_samples"]))
         if not 1000 <= c1["max_value"] <= 1400:
             failures.append("event %d ch1: height %d, expected ~1200"
                             % (b["index"], c1["max_value"]))
@@ -809,9 +915,103 @@ def test_invert():
     return failures
 
 
+# ===========================================================================
+# scenario 6: PER_CHANNEL, an unplugged channel's fault speaks for nobody
+# ===========================================================================
+def test_per_channel_fault():
+    """ch8's input is floating: it steps up once and never comes back, so it is the
+    detector's own max_width_samples guard that closes its "event" - exactly
+    max_width_samples after it opened, and ~25x wider than the pulses ch0 really saw
+    (the bench with the 9th channel unplugged).  That fault must not become the
+    bundle's verdict - ch0 measured the event, ch8 did not - nor may it pace the
+    group: ch0's pulses are reported as they close, not 2 s later when ch8's fault
+    finally does, because one broken input must not decide how often the M4 reports.
+    Its own fault still gets a row: ch8 is flagged TRUNCATED, and that bundle carries
+    no verdict (nothing measured it).
+    """
+    cfg = AggConfig()
+    cfg.mode = MODE_PER_CHANNEL
+    cfg.channel_mask = 0x0101           # ch0 and ch8 - ch8 is the unplugged one
+    cfg.primary = 8                     # the configured channel is the broken one
+
+    STEP_AT = 3500                      # after the 3000-sample quiet period
+    guard = cfg.detector.max_width_samples
+
+    def levels(i, gauss):
+        base0 = 2000.0 + gauss() * 10.0
+        for c in (24500, 26500):
+            base0 += gaussian_peak(i, c, 150, 1600.0)
+        base8 = 2000.0 + gauss() * 10.0
+        if i >= STEP_AT:
+            base8 += 800.0              # floating input: steps up and stays there
+        return {0: base0, 8: base8}
+
+    agg = EventAggregator(cfg)
+    events = run(agg, sample(28000, 10, levels))
+    failures = []
+
+    good = [r for r in events if r["bundle"]["valid"] == 1]
+    faults = [r for r in events
+              if (ch_by_id(r["ch"], 8) or {}).get("flags", 0) & CH_FLAG_TRUNCATED]
+    if len(good) != 2:
+        failures.append("fault: %d valid pulses reported, expected 2 (ch0's own)"
+                        % len(good))
+    for rec in good:
+        b = rec["bundle"]
+        c0, c8 = ch_by_id(rec["ch"], 0), ch_by_id(rec["ch"], 8)
+        if b["primary"] != 0:
+            failures.append("fault: event %d spoke for ch%d, expected ch0 - the fault "
+                            "outvoted it" % (b["index"], b["primary"]))
+        if b["width_samples"] >= 2000:
+            failures.append("fault: event %d reported the pulse with a %dsmp window - the "
+                            "fault paced the group" % (b["index"], b["width_samples"]))
+        if c0 is None or c0["flags"] != CH_FLAG_PRESENT or c0["reason"] != mc.REASON_OK:
+            failures.append("fault: event %d ch0 is not a plain measurement (%s)"
+                            % (b["index"], "missing" if c0 is None else
+                               "flags 0x%02x reason %d" % (c0["flags"], c0["reason"])))
+        if c8 is not None and c8["flags"] != 0:
+            failures.append("fault: event %d: ch8's fault row rode in a good bundle "
+                            "(flags 0x%02x)" % (b["index"], c8["flags"]))
+
+    if len(faults) != 1:
+        failures.append("fault: %d ch8 fault bundles, expected 1" % len(faults))
+    for rec in faults:
+        b = rec["bundle"]
+        c8 = ch_by_id(rec["ch"], 8)
+        # Nothing measured this event: ch8 was cut off by the guard and ch0 has not closed
+        # a pulse yet, so the bundle has no verdict at all - as before.
+        if b["primary"] != 0xFF:
+            failures.append("fault: event %d spoke for ch%d - nothing measured it"
+                            % (b["index"], b["primary"]))
+        if b["valid"] != 0:
+            failures.append("fault: event %d valid=%d - a fault is not a measurement"
+                            % (b["index"], b["valid"]))
+        if c8 is None or c8["reason"] == mc.REASON_OK:
+            failures.append("fault: event %d ch8 reads as a measurement" % b["index"])
+        if c8 is not None and c8["width_samples"] < guard:
+            failures.append("fault: event %d ch8 width %d, expected at least the guard's "
+                            "%d (it was held out, not measured)"
+                            % (b["index"], c8["width_samples"], guard))
+
+    if len(events) != len(good) + len(faults):
+        failures.append("fault: %d events for %d pulses + %d faults"
+                        % (len(events), len(good), len(faults)))
+
+    print("PER_CHANNEL fault: %d events (%d valid pulses, %d ch8 fault)"
+          % (len(events), len(good), len(faults)))
+    for rec in events:
+        b = rec["bundle"]
+        rows = "  ".join("ch%d:%dus/%dsmp f=0x%02x"
+                         % (c["channel"], c["width_us"], c["width_samples"], c["flags"])
+                         for c in rec["ch"])
+        print("  #%d valid=%d primary=%d window=%dsmp  %s"
+              % (b["index"], b["valid"], b["primary"], b["width_samples"], rows))
+    return failures
+
+
 def main():
     failures = (test_linked() + test_linked_clip() + test_per_channel() +
-                test_rail() + test_invert())
+                test_rail() + test_invert() + test_per_channel_fault())
     if failures:
         print("\nFAIL:")
         for f in failures:

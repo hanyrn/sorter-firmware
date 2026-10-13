@@ -184,11 +184,29 @@ TRACE_COLORS = ['#c62828', '#2e7d32', '#f9a825', '#6a1b9a',
 #
 #   Event #12  VALID     reason=0 OK  window=1234..5678us/24smp  primary=ch0  mode=linked
 #     ch0  max=1042  area=12033  width=2400us/24smp  base=5412  VALID
+#     ch1  absent  base=5410
+#     ch2  RAILED (input saturated)
 EVENT_HEAD = re.compile(r'^Event #(\d+)\s+(VALID|rejected)\s+reason=(\d+)\s+(\S+)'
                         r'\s+window=(\d+)\.\.(\d+)us/(\d+)smp\s+primary=ch(\d+)'
                         r'\s+mode=(\S+)')
 EVENT_CHANNEL = re.compile(r'^ch(\d+)\s+max=(-?\d+)\s+area=(\d+)\s+width=(\d+)us/'
                            r'(\d+)smp\s+base=(-?\d+)\s+(\S+)(?:\s+(\S+))?')
+# A channel with no peak of its own: a quiet input (an unplugged DAC, say) or one whose
+# excursion was over before the window it was judged in.  It prints no peak numbers -
+# only the DC level its own tracker sits on, which is what makes a flat input readable
+# as flat rather than as nothing at all.  The bare "ch0  absent" of a board built before
+# that base= was added still matches (group 2 then has no value).
+EVENT_ABSENT = re.compile(r'^ch(\d+)\s+absent(?:\s+base=(-?\d+))?\s*$')
+# A channel whose input railed (saturated, "signal too bright"): the board reports the
+# condition instead of a measurement, so the line has no numbers at all - neither a
+# window nor a peak.  It is still a record of its group, and unlike an absent channel it
+# is not even sitting on a baseline, so it carries nothing but the word.
+EVENT_RAILED = re.compile(r'^ch(\d+)\s+RAILED\b')
+# Any other line that opens with a channel number is a channel record too - a shape this
+# parser has not been taught yet (a newer board's wording, say).  It belongs to its group
+# as much as the known ones do, so it is kept without numbers rather than being treated as
+# the end of the group, which would silently drop every record printed after it.
+CHANNEL_RECORD = re.compile(r'^ch(\d+)\s')
 
 
 def volts_to_counts(volts, range_v):
@@ -346,7 +364,7 @@ class StreamParser:
         self.channels = []
         self.wf       = 0
         self.min_width_samples = 0             # the header's minw=: the judged floor
-        self.pending  = None                  # Event # head waiting for its ch line
+        self.pending  = None                  # Event # head waiting for its channel records
         self.sample_rate = SAMPLE_RATE_HZ      # events arrive in us; traces count samples
 
     # ---- bytes -> lines ----------------------------------------------------
@@ -402,11 +420,26 @@ class StreamParser:
         """Parse one closed event into what the page overlays on the traces.
 
         The head line arrives first, then one line per active channel - printBundle()
-        prints the whole group in one go.  The channel lines are held until the
-        window's *primary* channel reports, because that is the channel whose
-        crossing opened the window and whose numbers the verdict was computed from.
-        A RAILED or absent channel prints no numbers; the group is then closed with
-        whichever channel did report, and the tag names it.
+        prints the whole group in one go.  Every one of those lines joins the group,
+        because the page prints each channel's own numbers next to the primary's: the
+        primary's are still the ones the tag and the overlay are built from (its
+        crossing opened the window and the verdict was computed from them), while a
+        channel that never rose contributes the DC level alone ("absent  base=N").
+
+        The group is closed by the first line that is *not* a channel record - the next
+        sample line, the next head, the STREAM header, or the end of the stream - and
+        never by a record itself.  The records arrive in channel order, but the head
+        names the channel whose verdict the event carries, and in per-channel mode that
+        is the first channel to *close*, which can be one that prints before the others
+        (ch0 in front of a quiet ch8): a group ended on that channel's line would drop
+        every record printed after it.
+
+        A record need not carry numbers: a quiet input prints its DC level alone
+        ("absent  base=N") and a saturated one prints "RAILED (input saturated)".  Both
+        are records of the group, and a line that *looks* like one but is not a shape
+        this parser knows (a newer board's wording) is kept as it stands for the same
+        reason - losing the numbers printed beside it is the one thing worse than not
+        understanding it.
         """
         m = EVENT_HEAD.match(line)
         if m:
@@ -440,27 +473,87 @@ class StreamParser:
                 'reason_name': c.group(8) or c.group(7),
             }
             self.pending['chs'].append(ch)
-            if ch['channel'] == self.pending['primary']:
-                self.flush_event()
+            # Deliberately not a group closer: the head's channel is not necessarily the
+            # last record printed (see the docstring), so the group ends on the next
+            # line that is not a record at all.
+            return True
+
+        a = EVENT_ABSENT.match(line)
+        if a is not None and self.pending is not None:
+            # No peak of its own, so no peak numbers - and it stays in the group rather
+            # than closing it, which is what used to happen: an absent channel reported
+            # *before* the ones that did have numbers (ch0 in front of ch8, say) ended
+            # the group early and the numbers printed after it were dropped on the floor
+            # instead of being drawn.  Every channel record is treated alike: the group
+            # is ended by the next line that is not a record (see _event's docstring).
+            self.pending['chs'].append({
+                'channel':     int(a.group(1)),
+                'max':         None,
+                'area':        None,
+                'width_smp':   None,
+                'base':        int(a.group(2)) if a.group(2) is not None else None,
+                'verdict':     'absent',
+                'reason_name': 'absent',
+            })
+            return True
+
+        r = EVENT_RAILED.match(line)
+        if r is not None and self.pending is not None:
+            # Saturated input: the board sends `ch0  RAILED (input saturated)` instead of a
+            # measurement, in a group whose other channels therefore carry no numbers
+            # either (a rail notification is a "fix the input" message, not an event).  The
+            # line is kept so the tag can name the channel that did it, and it does not end
+            # the group: whatever the board printed after it still belongs to this window.
+            self.pending['chs'].append({
+                'channel':     int(r.group(1)),
+                'max':         None,
+                'area':        None,
+                'width_smp':   None,
+                'base':        None,
+                'verdict':     'absent',
+                'reason_name': 'RAILED',
+            })
+            return True
+
+        if self.pending is not None and CHANNEL_RECORD.match(line):
+            # A channel record in a shape this parser does not know: kept as it stands
+            # (no numbers, its own words for the tag) so the records printed after it are
+            # not lost to a group that ended too early.
+            tok = line.split()
+            self.pending['chs'].append({
+                'channel':     int(tok[0][2:]),
+                'max':         None,
+                'area':        None,
+                'width_smp':   None,
+                'base':        None,
+                'verdict':     'absent',
+                'reason_name': ' '.join(tok[1:]) or 'no numbers',
+            })
             return True
 
         if self.pending is not None and line.startswith('ch'):
-            self.flush_event()               # RAILED / absent: no numbers to draw
+            self.flush_event()               # a header or list line, not a record
         return False
 
     def flush_event(self):
         """Hand the decision collected so far to StreamState.
 
-        The primary channel's numbers win; if a group never reported them (it
-        railed, or the stream was cut short), the first channel that did report is
-        used so the window still gets an overlay.
+        The primary channel's numbers win and become the overlay's own - they are the
+        ones the verdict was computed from.  If the primary never reported any (it was
+        absent, it railed, or the stream was cut short), the first channel that did
+        report is used, so the window still gets an overlay.  The whole group rides
+        along in 'chs', which is what lets the tag print every channel of the window
+        and not only the one it is pinned to.
         """
         pend, self.pending = self.pending, None
         if pend is None or not pend['chs']:
             return
-        chans = pend.pop('chs')
+        chans = pend['chs']
+        num = [c for c in chans if c['max'] is not None]   # the ones with numbers to draw
+        if not num:
+            return                           # nothing was measured: no window to overlay
         primary = pend.pop('primary')
-        pend.update(next((c for c in chans if c['channel'] == primary), chans[0]))
+        pend.update(next((c for c in num if c['channel'] == primary), num[0]))
         self.state.add_event(pend)
 
     # ---- the two interesting lines -----------------------------------------
@@ -519,6 +612,11 @@ class StreamParser:
             self.cols[c].append(value)
 
     def flush(self):
+        # A stream that stops on an event bundle - a capture that ends mid-group, or a
+        # port that closes right after the last event - still ends the group, so the
+        # newest event is drawn instead of being held back for a line that never comes.
+        # (While the stream is running, the next sample line does this.)
+        self.flush_event()
         if self.gen:
             self.state.add_batch(self.frame_i, self.gen, self.cols, self.decim)
         self.gen, self.cols, self.frame_i, self.last_i = [], [], None, None
@@ -1424,7 +1522,11 @@ function applyData(m){
    sample indices), its width, the baseline it froze, the peak it reported on top
    of that baseline and the verdict.  Drawing these over the traces is what makes
    a decision auditable - a pulse buried in noise or two pulses merged into one
-   window cannot be judged from the trace alone. */
+   window cannot be judged from the trace alone.
+
+   The primary channel's numbers are the ones on the event itself; every channel of
+   the same window is in `chs`, so the tag can print them all (and mark the ones the
+   window never caught at all). */
 function applyEvent(ev){
   events.push(ev);
   if (events.length > EV_KEEP) events.splice(0, events.length - EV_KEEP);
@@ -1820,7 +1922,10 @@ function judge(ev){
 
    In the default LINKED mode (SORTER_METRIC_MODE = 1) the window *is* the detected
    width; in per-channel mode a channel can be narrower than the group window, and
-   the tag then spells out both.
+   the tag then spells out both.  The window is one channel's measurement, but the
+   whole group it came from is printed with it: the tag carries every other channel
+   of the same window in that channel's own colour, and says "absent" for one that
+   never rose at all (see the `ev.chs` segment below).
 
    Three things the lines cannot show are read off the trace and drawn in their own
    colours: a dip between two peaks inside one window (EV_DIP), a max the window's own
@@ -1967,6 +2072,36 @@ function drawEvents(view, X, Y, tags){
                     / (meta.sample_rate || 10000)) + 'us' });
     }
 
+    /* Every other channel of the same window, in its own trace's colour: the head text
+       carries the primary's numbers (the ones the verdict was computed from) and these
+       are what the rest measured over the same span - or the DC level one of them sat on
+       when it never rose at all ("absent", which is what an unplugged input looks like
+       and what used to be dropped here).  A channel's own width is printed only when it
+       differs from the event's, like `(exc ..)` above; in LINKED mode every channel
+       reports the primary's width, so only the numbers after it show.  A channel that
+       was judged differently from the event - per-channel mode, one channel rejected
+       while the one that opened the window was accepted - says so in its own segment,
+       because the tag's verdict word is the event's, not that channel's. */
+    (ev.chs || []).forEach((c) => {
+      if (c.channel === ev.channel) return;
+      const s = seriesFor(c.channel);
+      let txt = '  ch' + c.channel;
+      if (c.max === null){
+        /* No peak of its own.  A saturated input says so - the board's own words, so the
+           tag names the channel that needs fixing and does not read as a flat one - while
+           a channel that never rose contributes the DC level its tracker sits on. */
+        txt += (c.reason_name === 'RAILED' ? '  RAILED (input saturated)'
+                 : ' absent' + (c.base === null ? '' : '  base=' + c.base));
+      } else {
+        if (c.width_smp !== ev.width_smp) txt += '  w=' + c.width_smp + 'smp';
+        txt += '  max=' + c.max + '  base=' + c.base;
+        if (c.verdict !== (ev.valid ? 'VALID' : 'rejected')){
+          txt += '  rej ' + c.reason_name;
+        }
+      }
+      notes.push({ col: s ? s.col : col, text: txt });
+    });
+
     tags.push({ x: x0 + 3, col: col, notes: notes,
                 text: '#' + ev.index + ' ch' + ev.channel + ' '
                       + (ev.valid ? 'VALID' : 'rej ' + ev.reason_name)
@@ -1991,8 +2126,9 @@ function drawEvents(view, X, Y, tags){
 
 /* One tag per event, packed into a few rows across the top of the pane so that
    neighbouring windows (the busy case: merged pulses) stay readable.  A tag is the
-   measured numbers in the verdict colour, plus the overlay's own findings after
-   them, each in the colour it was drawn in on the canvas. */
+   measured numbers in the verdict colour, then one segment per other channel of the
+   same window in that channel's trace colour, then the overlay's own findings, each
+   in the colour it was drawn in on the canvas. */
 function drawEventTags(tags){
   g.font = 'bold 11px Segoe UI';
   g.textAlign = 'left'; g.textBaseline = 'top';

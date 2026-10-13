@@ -15,6 +15,10 @@
 //   3. PER_CHANNEL : ch0/ch1/ch8/ch9 fire with different widths; each channel
 //                    reports its own width/height/area and the event is reported
 //                    once the last channel of the group has closed.
+//   6. PC fault    : ch8 is unplugged - its input steps up and never returns, so the
+//                    detector's max_width_samples guard closes its "event".  ch0's
+//                    pulses must still be reported with ch0's verdict, and as they
+//                    close rather than when ch8's fault finally does.
 
 #include "../event_aggregator.h"
 #include <cstdio>
@@ -497,12 +501,88 @@ static void testInvert() {
     std::printf("INVERT: %d events (dips detected as peaks)\n", events);
 }
 
+// ---------------------------------------------------------------------------
+// 6. PER_CHANNEL: an unplugged channel's fault speaks for nobody
+// ---------------------------------------------------------------------------
+// ch8's input is floating: it steps up once and never comes back, so it is the
+// detector's own max_width_samples fault guard that closes its "event" - exactly
+// max_width_samples after it opened, and ~25x wider than the pulses ch0 really saw.
+// That is the bench with the 9th channel unplugged (see test_bench_detect.cpp), and
+// it must not become the bundle's verdict - ch0 measured the event, ch8 did not - nor
+// may it pace the group: ch0's pulses are reported as they close, not 2 s later when
+// ch8's fault finally does, because one broken input must not decide how often the M4
+// reports.  (Its own fault still gets a row: ch8 is flagged TRUNCATED and the bundle
+// carries no verdict.)
+static void testPerChannelFault() {
+    g_rng = 0x12345678u;
+    EventAggregator agg(aggConfig(METRIC_MODE_PER_CHANNEL, 0x0101u, 8));
+
+    const int      step_at  = 3500;                      // after the 3000-sample quiet time
+    const uint32_t guard    = detectorConfig().max_width_samples;
+    const PeakSpec peaks0[] = { {24500, 150, 1600.0}, {26500, 150, 1600.0} };
+    const ChannelSpec c0spec = { 0, BASE, peaks0, 2 };
+
+    int events = 0, good = 0, faults = 0;
+    for (int i = 0; i < 28000; i++) {
+        int32_t v[SORTER_MAX_CHANNELS];
+        for (int c = 0; c < SORTER_MAX_CHANNELS; c++) { v[c] = 0; }
+        v[0] = chanValue(i, c0spec);
+
+        double x8 = BASE + gauss() * NOISE;              // floating input ...
+        if (i >= step_at) { x8 += 800.0; }               // ... steps up and stays there
+        v[8] = (int32_t)std::lround(x8);
+
+        EventRecord rec;
+        if (!agg.update(v, (uint32_t)i * 10u, (uint32_t)i, rec)) { continue; }
+        events++;
+
+        const ChannelMetrics* c0 = findChannel(rec, 0);
+        const ChannelMetrics* c8 = findChannel(rec, 8);
+        if (rec.bundle.valid) {
+            good++;
+            CHECK(rec.bundle.primary == 0u,
+                  "fault: a valid bundle spoke for ch%u, expected ch0 - the fault outvoted it",
+                  (unsigned)rec.bundle.primary);
+            CHECK(rec.bundle.width_samples < 2000u,
+                  "fault: pulse reported with a %usmp window - the fault paced the group",
+                  (unsigned)rec.bundle.width_samples);
+            CHECK(c0 && c0->flags == CH_FLAG_PRESENT && c0->reason == REASON_OK,
+                  "fault: ch0 is not a plain measurement (flags=0x%02x reason=%u)",
+                  c0 ? (unsigned)c0->flags : 0u, c0 ? (unsigned)c0->reason : 0u);
+            CHECK(c8 && c8->flags == 0u,
+                  "fault: ch8's fault row rode in a good bundle (flags=0x%02x)",
+                  c8 ? (unsigned)c8->flags : 0u);
+        } else if (c8 && (c8->flags & CH_FLAG_TRUNCATED) != 0u) {
+            faults++;
+            // Nothing measured this event: ch8 was cut off by the guard and ch0 has not
+            // closed a pulse yet, so the bundle has no verdict at all - as before.
+            CHECK(rec.bundle.primary == 0xFFu,
+                  "fault: a fault bundle spoke for ch%u - nothing measured it",
+                  (unsigned)rec.bundle.primary);
+            CHECK(c8->reason != REASON_OK,
+                  "fault: ch8's fault row reads as a measurement (reason=%u)",
+                  (unsigned)c8->reason);
+            CHECK(c8->width_samples >= guard,
+                  "fault: ch8 width %u, expected at least the guard's %u (it was held out, "
+                  "not measured)",
+                  (unsigned)c8->width_samples, (unsigned)guard);
+        }
+    }
+    CHECK(good == 2, "fault: %d valid pulses reported, expected 2 (ch0's own)", good);
+    CHECK(faults == 1, "fault: %d ch8 fault bundles, expected 1", faults);
+    CHECK(events == good + faults, "fault: %d events for %d pulses + %d faults", events,
+          good, faults);
+    std::printf("PER_CHANNEL fault: %d events (%d valid pulses, %d ch8 fault)\n", events,
+                good, faults);
+}
+
 int main() {
     testLinked();
     testLinkedClip();
     testPerChannel();
     testRail();
     testInvert();
+    testPerChannelFault();
 
     if (g_failures > 0) {
         std::printf("\nFAILED: %d check(s)\n", g_failures);

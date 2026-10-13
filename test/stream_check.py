@@ -21,6 +21,10 @@ viewer's own StreamParser and StreamState, and asserts the pair still agrees on
   * the events - one overlay per printed `Event #` group, carrying the window, the
     width, the baseline, the peak and the verdict words the firmware printed rather
     than anything this side worked out;
+  * the channels of one window - the group is kept whole, so a channel that never rose
+    (`absent  base=N`, which no harness run prints: see check_absent) or one whose input
+    railed (`RAILED (input saturated)`: see check_rail) neither closes the group early
+    nor hides the channels that did report;
   * the harness's verdict on stderr - the same event and VALID counts the viewer
     ended up holding, so the line in the log pane describes what is on the page.
 
@@ -191,7 +195,11 @@ def check_samples(rep, state, decim, cycles, idxs, meta):
     rep.ok(meta.get('decim') == step,
            'the header announces a decimation the printed indices are not on',
            'header %r, grid %r' % (meta.get('decim'), step))
-    want_last = ((cycles * live_plot.BENCH_CYCLE_SAMPLES) // decim - 1) * decim
+    # The grid is every decim-th sample of the run, so the last point is the largest one
+    # inside it - not the last complete step, which is a step short of the end whenever
+    # decim does not divide the run (decim 7 over 240000 samples ends at 239995, the
+    # multiple of 7 below 240000, and that is the line the board prints).
+    want_last = ((cycles * live_plot.BENCH_CYCLE_SAMPLES - 1) // decim) * decim
     rep.ok(idxs[-1] == want_last,
            'the run stops at index %d; %d cycle(s) of %d samples at decim %d reach %d'
            % (idxs[-1], cycles, live_plot.BENCH_CYCLE_SAMPLES, decim, want_last))
@@ -288,6 +296,136 @@ def check_log(rep, state, groups):
            missing[0] if missing else '')
     rep.ok(not any(l.startswith('S,') for l in state.lines),
            'the sample lines are being echoed into the log pane')
+
+
+def check_absent(rep, range_v):
+    """A channel that never rose must not cost the ones that did.
+
+    Per-channel mode prints these (and so does an unplugged input in linked mode): the
+    channel reports the DC level its own tracker sits on and no peak at all, as
+    `ch0  absent  base=5412`.  Such a line carries no window and no numbers, and the old
+    parser closed the group on it - so a group that opened with a quiet ch0 threw away
+    the ch8 line printed after it.  The shapes the firmware can print are fed here in
+    order; each one has to end up on the page as one overlay, still pinned to the primary
+    (or to the first channel that did report, when the primary is the quiet one), with
+    every channel of the window in `chs` for the tag to print.
+    """
+    lines = [
+        # The usual case: the primary reports, a channel ahead of it never rose.
+        'Event #7  VALID     reason=0 OK  window=1000..2000us/20smp  primary=ch8'
+        '  mode=per-channel',
+        '  ch0  absent  base=5412',
+        '  ch8  max=1042  area=12033  width=2400us/24smp  base=5410  VALID',
+        # The primary is the quiet one: the overlay falls back to the channel that did
+        # report - a rule that predates all this - and both channels are still in the
+        # group.  This group is closed by the next head line, exactly as a board's own
+        # group is closed by the next sample line when its primary never reports.
+        'Event #8  VALID     reason=0 OK  window=3000..4000us/20smp  primary=ch8'
+        '  mode=per-channel',
+        '  ch0  max=1042  area=12033  width=2400us/24smp  base=5410  VALID',
+        '  ch8  absent  base=5412',
+        # A board built before the base= was added prints the bare word.
+        'Event #9  VALID     reason=0 OK  window=5000..6000us/20smp  primary=ch8'
+        '  mode=per-channel',
+        '  ch0  absent',
+        '  ch8  max=1042  area=12033  width=2400us/24smp  base=5410  VALID',
+        # Per-channel mode names the channel whose verdict the event carries, and that is
+        # the first channel to close - here ch0, whose record therefore prints BEFORE the
+        # quiet ch8's.  Both are records of one bundle, so a group that ended on the
+        # head's own channel would drop everything printed after it.
+        'Event #10  VALID     reason=0 OK  window=7000..8000us/20smp  primary=ch0'
+        '  mode=per-channel',
+        '  ch0  max=1042  area=12033  width=2400us/24smp  base=5410  VALID',
+        '  ch8  absent  base=5412',
+    ]
+    state, _parser = feed(lines, range_v)
+    if not rep.ok(len(state.events) == 4,
+                  'a group carrying an absent channel did not come out as one overlay '
+                  'per group (kept %d of 4)' % len(state.events)):
+        return
+    evs = {e['index']: e for e in state.events}
+
+    ev = evs[7]
+    rep.ok(ev.get('channel') == 8 and ev.get('max') == 1042,
+           'the absent channel printed before the primary ended the group: the numbers '
+           'after it were dropped',
+           'ch%s max=%s' % (ev.get('channel'), ev.get('max')))
+    chs = {c['channel']: c for c in ev.get('chs') or []}
+    rep.ok(sorted(chs) == [0, 8],
+           'the group did not keep every channel of the window for the tag to print',
+           'channels %r' % sorted(chs))
+    rep.ok(chs.get(0, {}).get('max') is None and chs.get(0, {}).get('base') == 5412,
+           'the absent channel did not keep the DC level it printed', repr(chs.get(0)))
+    rep.ok(chs.get(8, {}).get('max') == 1042 and chs.get(8, {}).get('base') == 5410,
+           'the channel that did report lost its own numbers', repr(chs.get(8)))
+
+    ev = evs[8]
+    rep.ok(ev.get('channel') == 0 and ev.get('max') == 1042,
+           'an absent *primary* did not fall back to the channel that reported',
+           'ch%s max=%s' % (ev.get('channel'), ev.get('max')))
+    rep.ok({c['channel'] for c in ev.get('chs') or []} == {0, 8},
+           'the group lost a channel when its primary was the absent one',
+           repr([c['channel'] for c in ev.get('chs') or []]))
+
+    ch0 = {c['channel']: c for c in (evs[9].get('chs') or [])}.get(0, {})
+    rep.ok(ch0.get('max') is None and ch0.get('base') is None,
+           'a bare "absent" line (a board without base=) was not understood', repr(ch0))
+
+    ev = evs[10]
+    rep.ok(ev.get('channel') == 0 and ev.get('max') == 1042,
+           "a record printed after the head's own channel was dropped: the group ended on "
+           'that channel instead of on the next line that is not a record',
+           'ch%s max=%s' % (ev.get('channel'), ev.get('max')))
+    chs = {c['channel']: c for c in ev.get('chs') or []}
+    rep.ok(sorted(chs) == [0, 8],
+           'a per-channel bundle lost the records printed after the verdict channel',
+           'channels %r' % sorted(chs))
+    rep.ok(chs.get(8, {}).get('max') is None and chs.get(8, {}).get('base') == 5412,
+           'the quiet channel printed last lost the DC level it came with',
+           repr(chs.get(8)))
+
+
+def check_rail(rep, range_v):
+    """A saturated input must not cost the event printed after it.
+
+    A rail is reported instead of a measurement - `*** SIGNAL TOO BRIGHT ***` and one
+    `ch0  RAILED (input saturated)` line - and, exactly like a quiet channel, that line
+    is a *record of its group*: a parser that ends the group on it is one line away from
+    dropping whatever the board prints next.  The rail bundle itself has no numbers in it
+    (it is a "fix the input" message, not an event), so the page must draw no overlay for
+    it - and the group right behind it has to arrive whole.  Like check_absent, this feeds
+    text the harness cannot produce: it has no switch for holding one input at the rail.
+    """
+    bright = ('*** SIGNAL TOO BRIGHT: an input railed (saturated). Reduce the source '
+              "intensity; that channel's detector was reset. ***")
+    lines = [
+        'Event #11  rejected  reason=6 RAILED  window=9000..9500us/15smp  primary=ch0'
+        '  mode=per-channel',
+        bright,
+        '  ch0  RAILED (input saturated)',
+        '  ch8  absent  base=5410',
+        # The event that follows: no part of the rail bundle may swallow it.
+        'Event #12  VALID     reason=0 OK  window=10000..11000us/20smp  primary=ch8'
+        '  mode=per-channel',
+        '  ch0  absent  base=5412',
+        '  ch8  max=1042  area=12033  width=2400us/24smp  base=5410  VALID',
+    ]
+    state, _parser = feed(lines, range_v)
+    rep.ok([e['index'] for e in state.events] == [12],
+           'the rail bundle was drawn as an overlay (it carries no numbers to draw) or it '
+           'took the event printed after it with it',
+           'overlays %r' % [e['index'] for e in state.events])
+    rep.ok(bright in state.lines,
+           'the operator cue for a saturated input never reached the log pane')
+    if not state.events:
+        return
+    ev = state.events[0]
+    rep.ok(ev.get('channel') == 8 and ev.get('max') == 1042,
+           'the event after a rail bundle lost its numbers', 'ch%s max=%s'
+           % (ev.get('channel'), ev.get('max')))
+    rep.ok({c['channel'] for c in ev.get('chs') or []} == {0, 8},
+           'the group after a rail bundle lost a channel',
+           repr([c['channel'] for c in ev.get('chs') or []]))
 
 
 def check_verdict(rep, stderr, cycles, state):
@@ -405,6 +543,12 @@ def main(argv=None):
     check_samples(rep, state, decim, cycles, idxs, meta)
     check_events(rep, state, parser, groups, idxs, meta)
     check_log(rep, state, groups)
+    # ... and the line no harness run prints: a quiet channel's `absent  base=N`, which
+    # only shows up on a board whose input never rose (see check_absent).
+    check_absent(rep, args.range_v)
+    # ... nor the line a saturated input prints: the harness has no switch for holding
+    # one input at the rail either (see check_rail).
+    check_rail(rep, args.range_v)
     check_verdict(rep, stderr, cycles, state)
     # ... and the one other run this viewer has a flag for (--sim-ladder): same lines,
     # same parser, and a report that has to stay off the stream.

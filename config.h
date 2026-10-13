@@ -70,8 +70,36 @@
 //
 // In both modes the M4 sends one bundle per event: the window plus one record
 // per active channel.  A channel that never rose is reported as absent.
-#define SORTER_METRIC_MODE     1
+#define SORTER_METRIC_MODE     0
 #define SORTER_PRIMARY_CHANNEL 8
+
+// Per-channel mode: which channel's verdict becomes the bundle's verdict.
+//
+// In per-channel mode a channel's own row is always its own measurement, but the
+// *bundle* still carries one verdict, and that verdict is what the M7 and the live
+// viewer show for the event (see the `live_plot.py` overlay).  It cannot simply be
+// the primary's: an unplugged channel's floating input is still a signal to its own
+// detector, and the max_width_samples fault guard closes it with an event ~100x
+// wider than the pulse the wired channels saw - which would let the one broken input
+// speak for the whole bundle and hide the real measurement.
+//
+// So the speaking channel is chosen as follows (see
+// EventAggregator::buildPerChannelRecord):
+//   1. the primary (SORTER_PRIMARY_CHANNEL) when it measured the event and is not
+//      outvoted - which is the normal case, so one event still has one voice;
+//   2. else the lowest channel that measured it and is not outvoted;
+//   3. else the lowest channel that measured it at all.
+// "Measured it" = its own verdict is a valid peak *and* the fault guard did not
+// close it; "outvoted" = another channel measured it too and none of them agrees
+// with this one's width (they all look at the same waveform through the same
+// conditioning, so the channels that really saw the event report widths within
+// SORTER_PC_WIDTH_AGREE_PCT of each other - a floating input does not).
+//
+// The same fault is also held out of the *group* while it lasts (a fault-closed
+// channel does not delay the bundle), so one broken input cannot dictate how often
+// the M4 reports either.  Set SORTER_PC_WIDTH_AGREE_PCT to 0 to switch the width
+// test off (rules 1-3 then reduce to "primary, else lowest measuring channel").
+#define SORTER_PC_WIDTH_AGREE_PCT 50
 
 // Per-channel input polarity: bit i = 1 means channel i is measured inverted.  The
 // primary channel (the 9th, index 8) idles HIGH and DIPS when an event occurs -
@@ -563,7 +591,7 @@ static const uint8_t AD7606_BUSY1_PIN  = A5;
 #define SIGNALGEN_BASELINE_CODE  2048    // DC level in DAC codes (~1.65 V)
 #define SIGNALGEN_NOISE_CODE     16      // dither amplitude in DAC codes (~13 mV)
 #define SIGNALGEN_NOISE_ALPHA    1.0f    // dither low-pass weight (1.0 = white)
-#define SIGNALGEN_BASELINE_WAVE_CODE    150      // slow wander of that DC level:
+#define SIGNALGEN_BASELINE_WAVE_CODE    0        // slow wander of that DC level:
                                                  // +/- this many DAC codes
                                                  // (~+/-792 AD counts at +/-5 V:
                                                  // 9x the dither, 3x the K_ON
@@ -593,7 +621,7 @@ static const uint8_t AD7606_BUSY1_PIN  = A5;
 #define SIGNALGEN_MERGE_MIN_OVERLAP 0.12f  // the two must overlap by at least this
                                            // fraction of the first pulse's width,
                                            // or they stay two separate events
-#define SIGNALGEN_WIDTH_MEAN       1200.0f // peak width (samples, 120 ms at 10 kSPS)
+#define SIGNALGEN_WIDTH_MEAN       600.0f // peak width (samples, 120 ms at 10 kSPS)
 #define SIGNALGEN_WIDTH_SD         260.0f
 #define SIGNALGEN_WIDTH_MIN        30u     // 3.0 ms: the narrowest event that still
                                            // has to be measured - its leading edge
@@ -784,8 +812,8 @@ static const uint8_t AD7606_BUSY1_PIN  = A5;
 // --ladder-count 4 (5000-sample slots), reading between 120 and 200 - the table's own
 // 240 ms cell.  So --ladder-count buys a wide rung the room to be drawn, and the table
 // stays the finer measurement of the floor (one raised cosine, fresh quiet period).
-#define SIGNALGEN_LADDER       0       // 0 = the random train, 1 = the floor ladder
-#define SIGNALGEN_LADDER_WIDTH 600u    // samples (60 ms): the width every rung has,
+#define SIGNALGEN_LADDER       1       // 0 = the random train, 1 = the floor ladder
+#define SIGNALGEN_LADDER_WIDTH 300u    // samples (60 ms): the width every rung has,
                                        // inside the band the table above covers
 #define SIGNALGEN_LADDER_MIN   40      // counts: the bottom rung's apex - well inside
                                        // the +/-84-count dither band, so the staircase

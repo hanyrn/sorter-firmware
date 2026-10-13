@@ -373,12 +373,24 @@ How the channels are tied together is chosen in `config.h`:
 | `SORTER_METRIC_MODE` | Behaviour |
 |---|---|
 | `1` (linked, default) | The **primary channel** (`SORTER_PRIMARY_CHANNEL`) times the event: the sample its trace leaves its own noise band opens the shared window and the sample it comes back into the band closes it. Every other channel's height/area is measured **inside that window only** (a channel that is still well inside its own excursion when the window closes - a second peak rising inside it - is clipped and flagged `TRUNCATED`), and all channels report the primary's width — so one event has exactly one width. |
-| `0` (per-channel) | Every channel is timed on its own (own start/end/width, so widths may differ). The event is reported once **all** channels that entered it have closed; the detector's `max_width_samples` guard closes a channel that never returns, so an event can never hang. |
+| `0` (per-channel) | Every channel is timed on its own (own start/end/width, so widths may differ). The event is reported once **all** channels that entered it have closed; the detector's `max_width_samples` guard closes a channel that never returns, so an event can never hang. A channel the guard closed is a *fault*, not a measurement: it is held out of the group while the fault lasts (it cannot delay the bundle) and it never speaks for it (below). |
 
 In both modes the bundle carries the event window (start/end/width), the channel
 that resolved the verdict (`primary`) and the mode, plus one record per channel in
 `SORTER_ACTIVE_CHANNEL_MASK`. A channel that never rose is reported as absent
 (`flags == 0`), so it is not mistaken for a zero-height peak.
+
+In per-channel mode that one verdict is taken from a channel that really measured
+the event: the primary when it did and no other measuring channel disagrees with its
+width, else the lowest channel that did. A channel is **outvoted** when another
+channel measured the same event and none of them agrees with it — an unplugged
+channel's *floating* input is still a signal to its own detector, and the
+`max_width_samples` guard closes it with an event roughly 100× wider than the pulse
+the wired channels saw, so without this the one broken input would speak for the
+whole bundle and hide the real measurement (and hold every bundle open until its own
+fault closed, cutting the report rate to one per guard period).
+`SORTER_PC_WIDTH_AGREE_PCT` is how close two judged widths must be to count as the
+same event, in percent of the wider one; `0` switches the comparison off.
 
 A **suppressed** rise candidate (see the rise test above) is suppressed for the
 aggregator too: in linked mode the shared window the primary's trace opened is
@@ -766,9 +778,16 @@ tick **full scale**
   a tag, `#12 ch0 VALID  w=54smp (exc 32smp)  max=1042  base=5412`, and the log pane
   still holds the M7's own wording for the same event; tick **detector overlay** off to
   see the bare traces. All of it comes from the lines `printBundle()` already prints, so
-  the board needs no change; the numbers are exactly the ones the log shows, and the tag
-  names the channel they came from (a window carries one line per active channel, and the
-  overlay shows the one whose crossing opened it). `w=` is the *duration* the verdict was
+  the board needs no change, and the numbers are exactly the ones the log shows. A window
+  carries one line per active channel; the tag is pinned to the channel whose crossing
+  opened it and shows that channel's numbers in the verdict's colour, and the window's
+  **other channels** follow it as segments in their own trace colours - each channel's
+  own `max`/`base` over the same span, its `w=` when that differs from the event's (the
+  per-channel mode), and `rej <reason>` when that channel was judged differently from the
+  event. A channel that never rose has no peak to report at all and prints as `absent`
+  with the DC level its tracker sits on (`base=N`, an unplugged input being the usual
+  reason) - that segment is the only number such a channel has. `w=` is the *duration* the
+  verdict was
   judged with (the excursion widened for the pulse's own envelope, see
   `EventDetector::envelopeDuration`), while `(exc Nsmp)` is the span the measurement
   actually covered - printed only when the two differ, which is what a faint pulse does.
